@@ -1,8 +1,8 @@
+import json
 import tempfile
 import unittest
-import json
-from io import BytesIO
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from unittest.mock import patch
 
 from app import create_app
@@ -37,6 +37,8 @@ class AegisApiTests(unittest.TestCase):
         self.assertEqual(len(self.client.get("/api/history/weather").json["items"]), 1)
 
     def test_forecast_alert_precedes_supervisory_mode_command(self):
+        # In the new architecture, forecast creates a pending proposal;
+        # NO command is queued until user approval.
         future = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
         response = self.client.post("/api/weather", json={
             "lat": 13.1,
@@ -45,29 +47,120 @@ class AegisApiTests(unittest.TestCase):
             "forecast": [{"timestamp": future, "pop": 85, "clouds": 95, "rain_mm_3h": 3, "wind_kmh": 20}],
         })
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json["pending_decision"]["target_mode"], "eco")
-        self.assertTrue(any("Mode change planned" in item["title"] for item in response.json["alerts"]))
+        pending = response.json["pending_decision"]
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["target_mode"], "eco")
+        self.assertTrue(any("Rain forecast" in item["title"] for item in response.json["alerts"]))
+
+        # Verified: No command sent without user approval
         commands = self.client.get("/api/simulink/commands").json["commands"]
-        self.assertEqual([item["kind"] for item in commands], ["mode"])
-        self.assertEqual(commands[0]["payload"]["source"], "weather_policy")
+        self.assertEqual(len(commands), 0)
+
+        # User approves proposal via /api/decisions/<id>/respond
+        decision_id = pending["id"]
+        res = self.client.post(f"/api/decisions/{decision_id}/respond", json={"approve": True})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json["status"], "approved")
+
+        # Command is now queued with parameters and decision_id
+        commands = self.client.get("/api/simulink/commands").json["commands"]
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["kind"], "mode")
+        self.assertEqual(commands[0]["payload"]["mode"], "eco")
+        self.assertEqual(commands[0]["payload"]["decision_id"], decision_id)
+        self.assertIn("parameters", commands[0]["payload"])
+        self.assertIn("expires_at", commands[0])
 
     def test_electrolyzer_auto_threshold_and_manual_override(self):
+        # Simulink owns automatic hysteresis (Decision 6); Flask mirrors state from telemetry.
+        # Sending telemetry does not automatically generate a command.
         response = self.client.post("/api/simulink/telemetry", json={
-            "telemetry": {"battery_soc": 90, "h2_level": 40, "irradiance_w_m2": 700, "solar_power_w": 1500, "load_power_w": 400},
+            "telemetry": {
+                "battery_soc": 90,
+                "h2_level": 40,
+                "irradiance_w_m2": 700,
+                "solar_power_w": 1500,
+                "load_power_w": 400,
+                "electrolyzer_enabled": True,
+            },
         })
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json["state"]["electrolyzer_enabled"])
         self.assertEqual(response.json["state"]["electrolyzer_control_mode"], "auto")
-        command = self.client.get("/api/simulink/commands").json["commands"][-1]
-        self.assertEqual(command["kind"], "electrolyzer")
+
+        # Verify no auto-command was queued by Flask
+        commands = self.client.get("/api/simulink/commands").json["commands"]
+        self.assertEqual(len(commands), 0)
+
+        # Manual override queues an operator command
         manual = self.client.post("/api/electrolyzer", json={"control_mode": "manual", "enabled": False})
         self.assertEqual(manual.status_code, 200)
         self.assertFalse(manual.json["state"]["electrolyzer_enabled"])
         self.assertEqual(manual.json["state"]["electrolyzer_control_mode"], "manual")
 
+        command = self.client.get("/api/simulink/commands").json["commands"][-1]
+        self.assertEqual(command["kind"], "electrolyzer")
+        self.assertFalse(command["payload"]["enabled"])
+
     def test_invalid_telemetry_is_rejected(self):
         response = self.client.post("/api/telemetry", json={"battery_soc": 140})
         self.assertEqual(response.status_code, 400)
+
+    def test_decision_decline_does_not_queue_command(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+        res = self.client.post("/api/weather", json={
+            "lat": 13.1, "lon": 77.6,
+            "weather": {"clouds": 80, "rain_mm_1h": 0},
+            "forecast": [{"timestamp": future, "pop": 85, "clouds": 95, "rain_mm_3h": 3, "wind_kmh": 20}],
+        })
+        pending = res.json["pending_decision"]
+        self.assertIsNotNone(pending)
+
+        # Operator declines
+        dec_res = self.client.post(f"/api/decisions/{pending['id']}/respond", json={"approve": False})
+        self.assertEqual(dec_res.status_code, 200)
+        self.assertEqual(dec_res.json["status"], "declined")
+
+        commands = self.client.get("/api/simulink/commands").json["commands"]
+        self.assertEqual(len(commands), 0)
+        state = self.client.get("/api/state").json
+        self.assertIsNone(state["pending_decision"])
+
+    def test_command_acknowledgment_lifecycle_and_alerts(self):
+        # Queue manual mode change
+        res = self.client.post("/api/mode", json={"mode": "boost"})
+        self.assertEqual(res.status_code, 200)
+        cmd_id = res.json["command_id"]
+
+        state = self.client.get("/api/state").json
+        self.assertEqual(state["requested_mode"], "boost")
+        self.assertIsNone(state["applied_mode"])  # Not applied until ack
+
+        # Acknowledge applied
+        ack_res = self.client.post(f"/api/simulink/commands/{cmd_id}/ack", json={"status": "applied"})
+        self.assertEqual(ack_res.status_code, 200)
+        self.assertEqual(ack_res.json["applied_mode"], "boost")
+
+        state = self.client.get("/api/state").json
+        self.assertEqual(state["applied_mode"], "boost")
+
+        # Now test rejected ack raises alert without modifying applied_mode
+        res2 = self.client.post("/api/mode", json={"mode": "eco"})
+        cmd_id2 = res2.json["command_id"]
+        ack_rej = self.client.post(f"/api/simulink/commands/{cmd_id2}/ack", json={"status": "rejected"})
+        self.assertEqual(ack_rej.status_code, 200)
+
+        state2 = self.client.get("/api/state").json
+        self.assertEqual(state2["applied_mode"], "boost")  # Unchanged
+        self.assertTrue(any("rejected" in a["title"] for a in state2["alerts"]))
+
+    def test_simulink_setpoints_endpoint(self):
+        self.client.post("/api/mode", json={"mode": "eco"})
+        setpoints = self.client.get("/api/simulink/setpoints").json
+        self.assertEqual(setpoints["mode"], "eco")
+        self.assertIn("parameters", setpoints)
+        self.assertEqual(setpoints["parameters"]["load_limit_w"], 85.0)
+        self.assertEqual(setpoints["parameters"]["electrolyzer_start_soc"], 90.0)
 
     def test_weather_provider_proxies_normalized_current_and_forecast(self):
         current = {

@@ -2,7 +2,7 @@
 
 Simulink remains responsible for fast electrical control and safety interlocks.
 This service stores telemetry, forecasts supervisory intent, and exposes durable
-commands for a Simulink process to poll and acknowledge.
+commands for a Simulink process to poll and acknowledge upon user approval.
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ from urllib.request import urlopen
 from flask import Flask, Response, jsonify, request
 
 from config import MODES, AegisConfig, load_config
+from policy import (
+    Proposal,
+    evaluate_policy,
+    get_mode_parameters,
+)
 from weather_service import (
     WeatherService,
     fetch_open_meteo_forecast,
@@ -76,7 +81,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         "measured_irradiance": None,
         "solar_power_w": None,
         "load_power_w": None,
-        "mode": "balanced",
+        "requested_mode": "balanced",
+        "mode": "balanced",  # Backward-compatible alias for requested_mode
         "applied_mode": None,
         "mode_control": "auto",
         "electrolyzer_control_mode": "auto",
@@ -88,6 +94,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         "outlook_daily": [],
         "recommendation": None,
         "pending_decision": None,
+        "active_setpoints": get_mode_parameters("balanced", None, cfg),
         "alerts": [],
         "last_telemetry_at": None,
         "last_weather_at": None,
@@ -111,7 +118,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             db.execute("CREATE TABLE IF NOT EXISTS weather_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT NOT NULL, payload TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS weather_outlook (id INTEGER PRIMARY KEY CHECK (id=1), fetched_at TEXT NOT NULL, payload TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS telemetry_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT NOT NULL, source TEXT NOT NULL, payload TEXT NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS commands (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, acknowledged_at TEXT)")
+            db.execute("CREATE TABLE IF NOT EXISTS commands (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, expires_at TEXT, acknowledged_at TEXT)")
+            db.execute("CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, target_mode TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, responded_at TEXT)")
+
+            # Lightweight migration: ensure expires_at exists in commands
+            cmd_cols = [row[1] for row in db.execute("PRAGMA table_info(commands)").fetchall()]
+            if "expires_at" not in cmd_cols:
+                db.execute("ALTER TABLE commands ADD COLUMN expires_at TEXT")
+
             existing = db.execute("SELECT payload FROM app_state WHERE id=1").fetchone()
             if existing is None:
                 db.execute("INSERT INTO app_state(id,payload) VALUES(1,?)", (json.dumps(state_defaults),))
@@ -146,74 +160,86 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         })
         state["alerts"] = state["alerts"][-100:]
 
-    def queue_command(db: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> int:
+    def queue_command(
+        db: sqlite3.Connection,
+        kind: str,
+        payload: dict[str, Any],
+        expires_in_seconds: float | None = None,
+    ) -> int:
+        now = utc_now()
+        ttl = expires_in_seconds if expires_in_seconds is not None else cfg.command_ttl_seconds
+        expires_at = (now + timedelta(seconds=ttl)).isoformat()
         cursor = db.execute(
-            "INSERT INTO commands(kind,payload,status,created_at) VALUES(?,?, 'pending', ?)",
-            (kind, json.dumps(payload, separators=(",", ":")), iso_now()),
+            "INSERT INTO commands(kind,payload,status,created_at,expires_at) VALUES(?,?, 'pending', ?, ?)",
+            (kind, json.dumps(payload, separators=(",", ":")), now.isoformat(), expires_at),
         )
         return int(cursor.lastrowid)
 
-    def evaluate_electrolyzer(db: sqlite3.Connection, state: dict[str, Any]) -> None:
-        if state["electrolyzer_control_mode"] != "auto":
-            return
-        soc = float(state["battery_soc"])
-        desired = state["electrolyzer_enabled"]
-        if soc >= 90:
-            desired = True
-        elif soc <= 88:
-            desired = False
-        if desired == state["electrolyzer_enabled"]:
-            return
-        state["electrolyzer_enabled"] = desired
-        command_id = queue_command(db, "electrolyzer", {"enabled": desired, "control_mode": "auto", "reason": "battery_soc_threshold", "battery_soc": soc})
-        state["last_command_id"] = command_id
-        title = "Electrolyzer enabled" if desired else "Electrolyzer disabled"
-        add_alert(state, "info", title, f"Automatic control changed state at {soc:.0f}% battery charge.")
+    def run_policy_assessment(db: sqlite3.Connection, state: dict[str, Any]) -> None:
+        """Run policy engine pure function evaluation and update proposals / lifecycle."""
+        outlook_row = db.execute("SELECT payload FROM weather_outlook WHERE id=1").fetchone()
+        outlook = json.loads(outlook_row["payload"]) if outlook_row else None
+        daily_outlook = outlook.get("daily", []) if outlook else []
 
-    def assess_mode(db: sqlite3.Connection, state: dict[str, Any]) -> None:
-        if not app.config.get("AUTO_MODE_CHANGES", True) or state["mode_control"] != "auto" or not state["forecast"]:
-            return
-        now = utc_now()
-        horizon: list[dict[str, Any]] = []
-        for item in state["forecast"]:
-            try:
-                timestamp = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
-            except (KeyError, ValueError, TypeError):
-                continue
-            if now <= timestamp <= now + timedelta(hours=6):
-                horizon.append(item)
-        max_pop = max((float(item.get("pop", 0)) for item in horizon), default=0)
-        rain_mm = max((float(item.get("rain_mm_3h", 0)) for item in horizon), default=0)
-        current_rain = float((state["weather"] or {}).get("rain_mm_1h", 0))
-        target = "eco" if current_rain > 0 or max_pop >= 60 or rain_mm >= 1 else None
-        if target is None and state["mode"] == "eco" and max_pop < 30 and current_rain == 0 and state["battery_soc"] >= 60:
-            target = "balanced"
-        if target is None or target == state["mode"]:
-            pending = state.get("pending_decision")
-            if pending and pending.get("status") == "notice_period":
-                pending["status"] = "cancelled"
-            state["recommendation"] = {"mode": state["mode"], "reason": "No forecast trigger for a mode change.", "confidence": "low"}
-            return
+        active_proposal = state.get("pending_decision")
 
-        reason = f"Rain risk in the next 6 hours: {max_pop:.0f}% precipitation probability; {rain_mm:.1f} mm forecast."
-        state["recommendation"] = {"mode": target, "reason": reason, "confidence": "medium"}
-        pending = state.get("pending_decision")
-        notice_seconds = app.config.get("MODE_NOTICE_SECONDS", 45)
-        if pending and pending.get("status") == "notice_period" and pending.get("target_mode") == target:
-            deadline = datetime.fromisoformat(pending["apply_after"])
-            if now >= deadline:
-                command_id = queue_command(db, "mode", {"mode": target, "source": "weather_policy", "reason": reason})
-                state["mode"] = target
-                state["last_command_id"] = command_id
-                pending["status"] = "command_queued"
-                pending["command_id"] = command_id
-            return
-        if pending and pending.get("status") == "notice_period":
-            pending["status"] = "cancelled"
-        decision_id = str(uuid.uuid4())
-        apply_after = (now + timedelta(seconds=notice_seconds)).isoformat()
-        state["pending_decision"] = {"id": decision_id, "target_mode": target, "reason": reason, "status": "notice_period", "created_at": now.isoformat(), "apply_after": apply_after}
-        add_alert(state, "warn", f"Mode change planned: {target.title()}", f"{reason} Planned in {notice_seconds} seconds unless conditions change.", key=f"mode:{decision_id}")
+        # Get last declined decision for decline cooldown rule
+        last_declined_row = db.execute(
+            "SELECT target_mode, payload, responded_at FROM decisions WHERE status='declined' ORDER BY responded_at DESC LIMIT 1"
+        ).fetchone()
+        last_declined = None
+        if last_declined_row:
+            dec_payload = json.loads(last_declined_row["payload"])
+            last_declined = {
+                "target_mode": last_declined_row["target_mode"],
+                "declined_at": last_declined_row["responded_at"],
+                "bad_days": len([d for d in dec_payload.get("reasons", []) if "consecutive" in d]),
+                "h2_level": state.get("h2_level", 100.0),
+            }
+
+        curr_mode = state.get("requested_mode", state.get("mode", "balanced"))
+        eval_result = evaluate_policy(
+            current_mode=curr_mode,
+            mode_control=state.get("mode_control", "auto"),
+            battery_soc=state.get("battery_soc"),
+            h2_level=state.get("h2_level"),
+            daily_outlook=daily_outlook,
+            current_weather=state.get("weather"),
+            config=cfg,
+            active_proposal=active_proposal,
+            last_declined=last_declined,
+            now=utc_now(),
+        )
+
+        action = eval_result["action"]
+        if action == "create":
+            proposal: Proposal = eval_result["proposal"]
+            db.execute(
+                "INSERT OR REPLACE INTO decisions(id, target_mode, payload, status, created_at, expires_at) VALUES(?, ?, ?, 'pending', ?, ?)",
+                (proposal.id, proposal.target_mode, json.dumps(proposal.to_dict()), proposal.created_at, proposal.expires_at),
+            )
+            state["pending_decision"] = proposal.to_dict()
+            add_alert(state, "warn", proposal.title, proposal.question, key=f"decision:{proposal.id}")
+            state["recommendation"] = {
+                "mode": proposal.target_mode,
+                "reason": proposal.reasons[0] if proposal.reasons else "Proposed mode change.",
+                "confidence": "high",
+            }
+
+        elif action == "withdraw":
+            if active_proposal:
+                p_id = active_proposal.get("id")
+                if p_id:
+                    db.execute("UPDATE decisions SET status='withdrawn', responded_at=? WHERE id=?", (iso_now(), p_id))
+            state["pending_decision"] = None
+            add_alert(state, "info", "Mode proposal withdrawn", eval_result["reason"])
+
+        elif action == "expire":
+            if active_proposal:
+                p_id = active_proposal.get("id")
+                if p_id:
+                    db.execute("UPDATE decisions SET status='expired', responded_at=? WHERE id=?", (iso_now(), p_id))
+            state["pending_decision"] = None
 
     def update_from_weather_service(weather: dict[str, Any] | None = None, outlook: dict[str, Any] | None = None) -> None:
         with lock, connect() as db:
@@ -244,6 +270,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             state["irradiance"] = irr
             state["irradiance_source"] = source
             state["data_quality"] = quality
+
+            run_policy_assessment(db, state)
             save_state(state, db)
 
     def state_response(db: sqlite3.Connection) -> dict[str, Any]:
@@ -270,10 +298,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if outlook and "daily" in outlook:
             state["outlook_daily"] = outlook["daily"]
 
-        assess_mode(db, state)
-        evaluate_electrolyzer(db, state)
-        save_state(state, db)
-        pending_commands = db.execute("SELECT COUNT(*) AS count FROM commands WHERE status='pending'").fetchone()["count"]
+        req_mode = state.get("requested_mode", "balanced")
+        state["mode"] = req_mode
+        state["active_setpoints"] = get_mode_parameters(req_mode, None, cfg)
+
+        pending_commands = db.execute(
+            "SELECT COUNT(*) AS count FROM commands WHERE status='pending' AND (expires_at IS NULL OR expires_at > ?)",
+            (iso_now(),),
+        ).fetchone()["count"]
         state["pending_command_count"] = pending_commands
         return state
 
@@ -320,6 +352,27 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 "quality": quality,
                 "timestamp": iso_now(),
                 "valid_for_s": 60,
+            })
+
+    @app.get("/api/simulink/setpoints")
+    def simulink_setpoints():
+        with lock, connect() as db:
+            state = load_state(db)
+            mode = state.get("requested_mode", "balanced")
+            load_limit = None
+            if mode == "boost":
+                cmd_row = db.execute(
+                    "SELECT payload FROM commands WHERE kind='mode' AND status IN ('pending', 'applied') ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if cmd_row:
+                    load_limit = json.loads(cmd_row["payload"]).get("parameters", {}).get("load_limit_w")
+            params = get_mode_parameters(mode, load_limit, cfg)
+            return jsonify({
+                "mode": mode,
+                "parameters": params,
+                "applied": state.get("applied_mode") == mode,
+                "simulink_connected": state.get("simulink_connected", False),
+                "timestamp": iso_now(),
             })
 
     @app.get("/api/weather/provider")
@@ -457,6 +510,23 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             if app.config.get("TESTING"):
                 state["location"] = {"lat": latitude, "lon": longitude}
 
+            # If forecast items contain daily-like data, convert for policy
+            daily_converted = []
+            for item in forecast:
+                daily_converted.append({
+                    "date": item.get("timestamp", "")[:10],
+                    "shortwave_radiation_sum_kwh_m2": 0.5 if item.get("pop", 0) > 50 else 4.0,
+                    "precipitation_sum_mm": item.get("rain_mm_3h", 0),
+                    "precipitation_probability_max": item.get("pop", 0),
+                })
+            if daily_converted:
+                outlook_payload = {"fetched_at": timestamp.isoformat(), "daily": daily_converted, "hourly": []}
+                db.execute(
+                    "INSERT OR REPLACE INTO weather_outlook(id, fetched_at, payload) VALUES(1, ?, ?)",
+                    (timestamp.isoformat(), json.dumps(outlook_payload)),
+                )
+                state["outlook_daily"] = daily_converted
+
             outlook_row = db.execute("SELECT payload FROM weather_outlook WHERE id=1").fetchone()
             outlook = json.loads(outlook_row["payload"]) if outlook_row else None
             irradiance, source, quality = resolve_irradiance(state, outlook, cfg, timestamp)
@@ -465,8 +535,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             state["data_quality"] = quality
 
             db.execute("INSERT INTO weather_samples(received_at,payload) VALUES(?,?)", (timestamp.isoformat(), json.dumps(snapshot)))
-            assess_mode(db, state)
-            evaluate_electrolyzer(db, state)
+            run_policy_assessment(db, state)
             save_state(state, db)
             return jsonify({
                 "accepted": True,
@@ -517,12 +586,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             for key in ("solar_power_w", "load_power_w"):
                 if key in values:
                     state[key] = values[key]
-            if "operating_mode" in clean:
-                state["applied_mode"] = clean["operating_mode"]
+
+            # Mirror electrolyzer state from telemetry
             if "electrolyzer_enabled" in clean:
                 state["electrolyzer_available"] = True
-                if state["electrolyzer_control_mode"] == "manual":
-                    state["electrolyzer_enabled"] = clean["electrolyzer_enabled"]
+                state["electrolyzer_enabled"] = clean["electrolyzer_enabled"]
+
             state["last_telemetry_at"] = timestamp
             state["simulink_connected"] = True
 
@@ -534,8 +603,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             state["data_quality"] = qual
 
             db.execute("INSERT INTO telemetry_samples(received_at,source,payload) VALUES(?,?,?)", (timestamp, source, json.dumps(clean)))
-            evaluate_electrolyzer(db, state)
-            assess_mode(db, state)
+
+            # Assess policy dynamically with new telemetry values
+            run_policy_assessment(db, state)
             save_state(state, db)
             return jsonify({"accepted": True, "source": source, "state": state})
 
@@ -553,25 +623,40 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         mode = body.get("mode")
         if mode not in MODES:
             return jsonify({"error": "mode must be eco, balanced, or boost"}), 400
+
         with lock, connect() as db:
             state = load_state(db)
-            old_decision = state.get("pending_decision")
-            if old_decision and old_decision.get("status") == "notice_period":
-                old_decision["status"] = "cancelled_by_operator"
+            # Withdraw any active pending proposal
+            if state.get("pending_decision"):
+                p_id = state["pending_decision"].get("id")
+                if p_id:
+                    db.execute("UPDATE decisions SET status='withdrawn', responded_at=? WHERE id=?", (iso_now(), p_id))
+                state["pending_decision"] = None
+
             state["mode_control"] = "manual"
+            state["requested_mode"] = mode
             state["mode"] = mode
-            state["recommendation"] = {"mode": mode, "reason": "Operator selected this mode.", "confidence": "operator"}
-            command_id = queue_command(db, "mode", {"mode": mode, "source": "dashboard", "operator": body.get("operator", "user")})
-            state["last_command_id"] = command_id
+            state["recommendation"] = {"mode": mode, "reason": "Operator manually selected this mode.", "confidence": "operator"}
+
+            params = get_mode_parameters(mode, None, cfg)
+            state["active_setpoints"] = params
+            cmd_payload = {
+                "mode": mode,
+                "parameters": params,
+                "source": "dashboard_manual",
+                "operator": body.get("operator", "user"),
+            }
+            cmd_id = queue_command(db, "mode", cmd_payload)
+            state["last_command_id"] = cmd_id
             save_state(state, db)
-            return jsonify({"accepted": True, "command_id": command_id, "state": state})
+            return jsonify({"accepted": True, "command_id": cmd_id, "state": state})
 
     @app.post("/api/mode/auto")
     def set_mode_auto():
         with lock, connect() as db:
             state = load_state(db)
             state["mode_control"] = "auto"
-            assess_mode(db, state)
+            run_policy_assessment(db, state)
             save_state(state, db)
             return jsonify({"accepted": True, "state": state})
 
@@ -583,44 +668,106 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify({"error": "control_mode must be auto or manual"}), 400
         if control_mode == "manual" and not isinstance(body.get("enabled"), bool):
             return jsonify({"error": "manual control requires a boolean enabled field"}), 400
+
         with lock, connect() as db:
             state = load_state(db)
-            previous = state["electrolyzer_enabled"]
             state["electrolyzer_control_mode"] = control_mode
             if control_mode == "manual":
                 state["electrolyzer_enabled"] = body["enabled"]
+                cmd_payload = {"enabled": body["enabled"], "control_mode": "manual", "source": "operator_override"}
+                reason = "operator_manual_override"
             else:
-                state["electrolyzer_enabled"] = state["battery_soc"] >= 90
-            if state["electrolyzer_enabled"] != previous or control_mode == "manual":
-                reason = "operator_override" if control_mode == "manual" else "automatic_soc_rule"
-                command_id = queue_command(db, "electrolyzer", {"enabled": state["electrolyzer_enabled"], "control_mode": control_mode, "reason": reason})
-                state["last_command_id"] = command_id
+                cmd_payload = {"control_mode": "auto", "source": "operator_release_to_simulink"}
+                reason = "operator_release_to_auto"
+
+            cmd_id = queue_command(db, "electrolyzer", cmd_payload)
+            state["last_command_id"] = cmd_id
             save_state(state, db)
-            return jsonify({"accepted": True, "state": state})
+            return jsonify({"accepted": True, "command_id": cmd_id, "state": state})
+
+    @app.post("/api/decisions/<decision_id>/respond")
+    def respond_decision(decision_id: str):
+        body = request.get_json(silent=True) or {}
+        if "approve" not in body or not isinstance(body["approve"], bool):
+            return jsonify({"error": "approve must be boolean"}), 400
+        approve = body["approve"]
+
+        with lock, connect() as db:
+            row = db.execute("SELECT id,target_mode,payload,status,expires_at FROM decisions WHERE id=?", (decision_id,)).fetchone()
+            if not row or row["status"] != "pending":
+                return jsonify({"error": "pending decision not found"}), 404
+
+            state = load_state(db)
+            now = utc_now()
+            now_iso = now.isoformat()
+            target_mode = row["target_mode"]
+            decision_payload = json.loads(row["payload"])
+
+            if approve:
+                db.execute("UPDATE decisions SET status='approved', responded_at=? WHERE id=?", (now_iso, decision_id))
+                state["pending_decision"] = None
+                state["requested_mode"] = target_mode
+                state["mode"] = target_mode
+                params = get_mode_parameters(target_mode, decision_payload.get("suggested_load_limit_w"), cfg)
+                state["active_setpoints"] = params
+                cmd_payload = {
+                    "mode": target_mode,
+                    "parameters": params,
+                    "decision_id": decision_id,
+                    "source": "user_approval",
+                }
+                cmd_id = queue_command(db, "mode", cmd_payload)
+                state["last_command_id"] = cmd_id
+                add_alert(state, "info", f"Mode switch to {target_mode.title()} approved", "Command queued for Simulink.")
+                save_state(state, db)
+                return jsonify({"accepted": True, "status": "approved", "command_id": cmd_id, "state": state})
+            else:
+                db.execute("UPDATE decisions SET status='declined', responded_at=? WHERE id=?", (now_iso, decision_id))
+                state["pending_decision"] = None
+                add_alert(state, "info", "Mode proposal declined", "Operating mode remains unchanged.")
+                save_state(state, db)
+                return jsonify({"accepted": True, "status": "declined", "state": state})
 
     @app.post("/api/decisions/<decision_id>/cancel")
     def cancel_decision(decision_id: str):
+        # Alias to decline
         with lock, connect() as db:
-            state = load_state(db)
-            decision = state.get("pending_decision")
-            if not decision or decision.get("id") != decision_id or decision.get("status") != "notice_period":
+            row = db.execute("SELECT id,status FROM decisions WHERE id=?", (decision_id,)).fetchone()
+            if not row or row["status"] != "pending":
                 return jsonify({"error": "pending decision not found"}), 404
-            decision["status"] = "cancelled_by_operator"
+            now_iso = iso_now()
+            db.execute("UPDATE decisions SET status='declined', responded_at=? WHERE id=?", (now_iso, decision_id))
+            state = load_state(db)
+            state["pending_decision"] = None
             state["mode_control"] = "manual"
             add_alert(state, "info", "Planned mode change cancelled", "The current mode will remain active.")
             save_state(state, db)
-            return jsonify({"accepted": True, "state": state})
+            return jsonify({"accepted": True, "status": "declined", "state": state})
 
     @app.get("/api/simulink/commands")
     def simulink_commands():
         after = request.args.get("after", default=0, type=int)
+        now_iso = iso_now()
         with lock, connect() as db:
-            state = load_state(db)
-            assess_mode(db, state)
-            evaluate_electrolyzer(db, state)
-            save_state(state, db)
-            rows = db.execute("SELECT id,kind,payload,status,created_at FROM commands WHERE status='pending' AND id>? ORDER BY id LIMIT 100", (max(after, 0),)).fetchall()
-            return jsonify({"commands": [{"id": row["id"], "kind": row["kind"], "payload": json.loads(row["payload"]), "status": row["status"], "created_at": row["created_at"]} for row in rows]})
+            # Mark expired commands
+            db.execute("UPDATE commands SET status='expired' WHERE status='pending' AND expires_at IS NOT NULL AND expires_at <= ?", (now_iso,))
+            rows = db.execute(
+                "SELECT id,kind,payload,status,created_at,expires_at FROM commands WHERE status='pending' AND id>? ORDER BY id LIMIT 100",
+                (max(after, 0),),
+            ).fetchall()
+            return jsonify({
+                "commands": [
+                    {
+                        "id": row["id"],
+                        "kind": row["kind"],
+                        "payload": json.loads(row["payload"]),
+                        "status": row["status"],
+                        "created_at": row["created_at"],
+                        "expires_at": row["expires_at"],
+                    }
+                    for row in rows
+                ]
+            })
 
     @app.post("/api/simulink/commands/<int:command_id>/ack")
     def acknowledge_command(command_id: int):
@@ -628,11 +775,42 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         status = body.get("status", "applied")
         if status not in {"applied", "rejected", "failed"}:
             return jsonify({"error": "status must be applied, rejected, or failed"}), 400
-        with connect() as db:
-            cursor = db.execute("UPDATE commands SET status=?,acknowledged_at=? WHERE id=? AND status='pending'", (status, iso_now(), command_id))
-            if cursor.rowcount == 0:
+
+        now_iso = iso_now()
+        with lock, connect() as db:
+            cmd_row = db.execute(
+                "SELECT id,kind,payload,status,expires_at FROM commands WHERE id=? AND status='pending'",
+                (command_id,),
+            ).fetchone()
+            if not cmd_row:
                 return jsonify({"error": "pending command not found"}), 404
-            return jsonify({"accepted": True, "command_id": command_id, "status": status})
+
+            if cmd_row["expires_at"] and cmd_row["expires_at"] <= now_iso:
+                db.execute("UPDATE commands SET status='expired' WHERE id=?", (command_id,))
+                return jsonify({"error": "command expired and cannot be acknowledged", "command_id": command_id}), 410
+
+            db.execute("UPDATE commands SET status=?, acknowledged_at=? WHERE id=?", (status, now_iso, command_id))
+            state = load_state(db)
+
+            cmd_payload = json.loads(cmd_row["payload"])
+            if cmd_row["kind"] == "mode":
+                if status == "applied":
+                    state["applied_mode"] = cmd_payload["mode"]
+                elif status in ("rejected", "failed"):
+                    add_alert(
+                        state,
+                        "critical",
+                        f"Simulink {status} {cmd_payload.get('mode', '')} mode",
+                        "Safety interlock or physical plant constraint rejected supervisory mode setpoints.",
+                    )
+
+            save_state(state, db)
+            return jsonify({
+                "accepted": True,
+                "command_id": command_id,
+                "status": status,
+                "applied_mode": state.get("applied_mode"),
+            })
 
     @app.get("/api/history/<kind>")
     def history(kind: str):
@@ -647,8 +825,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             elif kind == "commands":
                 rows = db.execute("SELECT id,kind,payload,status,created_at,acknowledged_at FROM commands ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
                 values = [{"id": row["id"], "kind": row["kind"], "payload": json.loads(row["payload"]), "status": row["status"], "created_at": row["created_at"], "acknowledged_at": row["acknowledged_at"]} for row in rows]
+            elif kind == "decisions":
+                rows = db.execute("SELECT id,target_mode,payload,status,created_at,expires_at,responded_at FROM decisions ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+                values = [{"id": row["id"], "target_mode": row["target_mode"], "status": row["status"], "created_at": row["created_at"], "expires_at": row["expires_at"], "responded_at": row["responded_at"], **json.loads(row["payload"])} for row in rows]
             else:
-                return jsonify({"error": "kind must be weather, telemetry, or commands"}), 400
+                return jsonify({"error": "kind must be weather, telemetry, commands, or decisions"}), 400
             return jsonify({"items": values})
 
     initialize_db()
