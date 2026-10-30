@@ -29,3 +29,9 @@ Thumbs.db
 # Logs & temp
 *.log
 scratch/
+
+# MATLAB / Simulink
+slprj/
+*.slx.autosave
+*.slxc
+*.asv
