@@ -1,4 +1,4 @@
-"""AEGIS supervisory API for the dashboard and a future Simulink adapter.
+"""AEGIS supervisory API for the dashboard and Simulink adapter.
 
 Simulink remains responsible for fast electrical control and safety interlocks.
 This service stores telemetry, forecasts supervisory intent, and exposes durable
@@ -13,13 +13,24 @@ import os
 import sqlite3
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
-from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from flask import Flask, Response, jsonify, request
+
+from config import MODES, AegisConfig, load_config
+from weather_service import (
+    WeatherService,
+    fetch_open_meteo_forecast,
+    fetch_openweather_current,
+    normalize_openweather_current,
+    parse_open_meteo_payload,
+    resolve_irradiance,
+    solar_irradiance_estimate,
+)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -28,33 +39,6 @@ class ClosingConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
-
-
-MODES = {"eco", "balanced", "boost"}
-STATE_DEFAULTS: dict[str, Any] = {
-    "schema_version": 1,
-    "battery_soc": 46.0,
-    "h2_level": 68.0,
-    "irradiance": 0.0,
-    "irradiance_source": "unavailable",
-    "solar_power_w": None,
-    "load_power_w": None,
-    "mode": "balanced",
-    "applied_mode": None,
-    "mode_control": "auto",
-    "electrolyzer_control_mode": "auto",
-    "electrolyzer_enabled": False,
-    "electrolyzer_available": True,
-    "location": {"lat": 13.1007, "lon": 77.5963},
-    "weather": None,
-    "forecast": [],
-    "recommendation": None,
-    "pending_decision": None,
-    "alerts": [],
-    "last_telemetry_at": None,
-    "last_weather_at": None,
-    "last_command_id": 0,
-}
 
 
 def utc_now() -> datetime:
@@ -74,52 +58,42 @@ def finite_number(value: Any, name: str, minimum: float, maximum: float) -> floa
     return result
 
 
-def solar_irradiance_estimate(latitude: float, longitude: float, clouds: float, at: datetime) -> float:
-    """Approximate GHI from location, UTC time and cloud fraction; not a sensor reading."""
-    day = at.timetuple().tm_yday
-    hour = at.hour + at.minute / 60 + at.second / 3600
-    gamma = 2 * math.pi / 365 * (day - 1 + (hour - 12) / 24)
-    equation_time = 229.18 * (
-        0.000075
-        + 0.001868 * math.cos(gamma)
-        - 0.032077 * math.sin(gamma)
-        - 0.014615 * math.cos(2 * gamma)
-        - 0.040849 * math.sin(2 * gamma)
-    )
-    declination = (
-        0.006918
-        - 0.399912 * math.cos(gamma)
-        + 0.070257 * math.sin(gamma)
-        - 0.006758 * math.cos(2 * gamma)
-        + 0.000907 * math.sin(2 * gamma)
-        - 0.002697 * math.cos(3 * gamma)
-        + 0.00148 * math.sin(3 * gamma)
-    )
-    true_solar_minutes = (hour * 60 + equation_time + 4 * longitude) % 1440
-    hour_angle = math.radians(true_solar_minutes / 4 - 180)
-    lat = math.radians(latitude)
-    sin_elevation = (
-        math.sin(lat) * math.sin(declination)
-        + math.cos(lat) * math.cos(declination) * math.cos(hour_angle)
-    )
-    if sin_elevation <= 0:
-        return 0.0
-    cloud_fraction = min(1.0, max(0.0, clouds / 100))
-    cloud_factor = max(0.0, 1 - 0.75 * cloud_fraction**3.4)
-    return round(1000 * sin_elevation * 0.75 * cloud_factor, 1)
-
-
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
-    app.config.update(
-        DATABASE=os.environ.get("AEGIS_DB", os.path.join(app.root_path, "data", "aegis.sqlite3")),
-        MODE_NOTICE_SECONDS=45,
-        AUTO_MODE_CHANGES=True,
-        OPENWEATHER_API_KEY=os.environ.get("OPENWEATHER_API_KEY", ""),
-        MAX_CONTENT_LENGTH=256 * 1024,
-    )
+    cfg: AegisConfig = load_config(overrides=test_config)
+    app.config.update(cfg.to_dict())
     if test_config:
         app.config.update(test_config)
+    app.aegis_config = cfg
+
+    state_defaults: dict[str, Any] = {
+        "schema_version": 2,
+        "battery_soc": 46.0,
+        "h2_level": 68.0,
+        "irradiance": 0.0,
+        "irradiance_source": "cloud-cover-estimate",
+        "data_quality": "fallback",
+        "measured_irradiance": None,
+        "solar_power_w": None,
+        "load_power_w": None,
+        "mode": "balanced",
+        "applied_mode": None,
+        "mode_control": "auto",
+        "electrolyzer_control_mode": "auto",
+        "electrolyzer_enabled": False,
+        "electrolyzer_available": True,
+        "location": {"lat": cfg.plant_lat, "lon": cfg.plant_lon},
+        "weather": None,
+        "forecast": [],
+        "outlook_daily": [],
+        "recommendation": None,
+        "pending_decision": None,
+        "alerts": [],
+        "last_telemetry_at": None,
+        "last_weather_at": None,
+        "last_command_id": 0,
+        "simulink_connected": False,
+    }
 
     lock = threading.RLock()
 
@@ -135,19 +109,21 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("CREATE TABLE IF NOT EXISTS app_state (id INTEGER PRIMARY KEY CHECK (id=1), payload TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS weather_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT NOT NULL, payload TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS weather_outlook (id INTEGER PRIMARY KEY CHECK (id=1), fetched_at TEXT NOT NULL, payload TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS telemetry_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT NOT NULL, source TEXT NOT NULL, payload TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS commands (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, acknowledged_at TEXT)")
-            existing = db.execute("SELECT 1 FROM app_state WHERE id=1").fetchone()
+            existing = db.execute("SELECT payload FROM app_state WHERE id=1").fetchone()
             if existing is None:
-                db.execute("INSERT INTO app_state(id,payload) VALUES(1,?)", (json.dumps(STATE_DEFAULTS),))
+                db.execute("INSERT INTO app_state(id,payload) VALUES(1,?)", (json.dumps(state_defaults),))
 
     def load_state(db: sqlite3.Connection | None = None) -> dict[str, Any]:
         if db is None:
             with connect() as connection:
                 return load_state(connection)
         row = db.execute("SELECT payload FROM app_state WHERE id=1").fetchone()
-        state = dict(STATE_DEFAULTS)
-        state.update(json.loads(row["payload"]))
+        state = dict(state_defaults)
+        if row:
+            state.update(json.loads(row["payload"]))
         return state
 
     def save_state(state: dict[str, Any], db: sqlite3.Connection | None = None) -> None:
@@ -161,8 +137,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if key and any(item.get("key") == key for item in state["alerts"]):
             return
         state["alerts"].append({
-            "id": str(uuid.uuid4()), "severity": severity, "title": title,
-            "message": message, "created_at": iso_now(), "key": key,
+            "id": str(uuid.uuid4()),
+            "severity": severity,
+            "title": title,
+            "message": message,
+            "created_at": iso_now(),
+            "key": key,
         })
         state["alerts"] = state["alerts"][-100:]
 
@@ -191,7 +171,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         add_alert(state, "info", title, f"Automatic control changed state at {soc:.0f}% battery charge.")
 
     def assess_mode(db: sqlite3.Connection, state: dict[str, Any]) -> None:
-        if not app.config["AUTO_MODE_CHANGES"] or state["mode_control"] != "auto" or not state["forecast"]:
+        if not app.config.get("AUTO_MODE_CHANGES", True) or state["mode_control"] != "auto" or not state["forecast"]:
             return
         now = utc_now()
         horizon: list[dict[str, Any]] = []
@@ -218,6 +198,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         reason = f"Rain risk in the next 6 hours: {max_pop:.0f}% precipitation probability; {rain_mm:.1f} mm forecast."
         state["recommendation"] = {"mode": target, "reason": reason, "confidence": "medium"}
         pending = state.get("pending_decision")
+        notice_seconds = app.config.get("MODE_NOTICE_SECONDS", 45)
         if pending and pending.get("status") == "notice_period" and pending.get("target_mode") == target:
             deadline = datetime.fromisoformat(pending["apply_after"])
             if now >= deadline:
@@ -230,13 +211,65 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if pending and pending.get("status") == "notice_period":
             pending["status"] = "cancelled"
         decision_id = str(uuid.uuid4())
-        apply_after = (now + timedelta(seconds=app.config["MODE_NOTICE_SECONDS"])).isoformat()
+        apply_after = (now + timedelta(seconds=notice_seconds)).isoformat()
         state["pending_decision"] = {"id": decision_id, "target_mode": target, "reason": reason, "status": "notice_period", "created_at": now.isoformat(), "apply_after": apply_after}
-        add_alert(state, "warn", f"Mode change planned: {target.title()}", f"{reason} Planned in {app.config['MODE_NOTICE_SECONDS']} seconds unless conditions change.", key=f"mode:{decision_id}")
+        add_alert(state, "warn", f"Mode change planned: {target.title()}", f"{reason} Planned in {notice_seconds} seconds unless conditions change.", key=f"mode:{decision_id}")
+
+    def update_from_weather_service(weather: dict[str, Any] | None = None, outlook: dict[str, Any] | None = None) -> None:
+        with lock, connect() as db:
+            state = load_state(db)
+            if weather:
+                state["weather"] = weather
+                state["last_weather_at"] = iso_now()
+            if outlook:
+                db.execute(
+                    "INSERT OR REPLACE INTO weather_outlook(id, fetched_at, payload) VALUES(1, ?, ?)",
+                    (outlook["fetched_at"], json.dumps(outlook)),
+                )
+                state["outlook_daily"] = outlook.get("daily", [])
+                hourly = outlook.get("hourly") or []
+                if hourly:
+                    state["forecast"] = [
+                        {
+                            "timestamp": item.get("time"),
+                            "temp": None,
+                            "pop": round(float(item.get("precipitation_probability_pct", 0))),
+                            "clouds": round(float(item.get("cloud_cover_pct", 0))),
+                            "rain_mm_3h": 0,
+                            "wind_kmh": 0,
+                        }
+                        for item in hourly[:40]
+                    ]
+            irr, source, quality = resolve_irradiance(state, outlook, cfg, utc_now())
+            state["irradiance"] = irr
+            state["irradiance_source"] = source
+            state["data_quality"] = quality
+            save_state(state, db)
 
     def state_response(db: sqlite3.Connection) -> dict[str, Any]:
         state = load_state(db)
-        state["weather_provider_configured"] = bool(app.config["OPENWEATHER_API_KEY"])
+        state["weather_provider_configured"] = bool(app.config.get("OPENWEATHER_API_KEY"))
+
+        last_telem = state.get("last_telemetry_at")
+        if last_telem:
+            try:
+                telem_dt = datetime.fromisoformat(last_telem.replace("Z", "+00:00"))
+                age_s = (utc_now() - telem_dt).total_seconds()
+                state["simulink_connected"] = (age_s <= cfg.telemetry_stale_seconds)
+            except Exception:
+                state["simulink_connected"] = False
+        else:
+            state["simulink_connected"] = False
+
+        outlook_row = db.execute("SELECT payload FROM weather_outlook WHERE id=1").fetchone()
+        outlook = json.loads(outlook_row["payload"]) if outlook_row else None
+        irr, source, quality = resolve_irradiance(state, outlook, cfg, utc_now())
+        state["irradiance"] = irr
+        state["irradiance_source"] = source
+        state["data_quality"] = quality
+        if outlook and "daily" in outlook:
+            state["outlook_daily"] = outlook["daily"]
+
         assess_mode(db, state)
         evaluate_electrolyzer(db, state)
         save_state(state, db)
@@ -246,8 +279,16 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.after_request
     def cors(response):
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Device-Id"
+        allowed_origins = app.config.get("CORS_ORIGINS", ["*"])
+        req_origin = request.headers.get("Origin")
+        if "*" in allowed_origins or not allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        elif req_origin in allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = req_origin
+        else:
+            response.headers["Access-Control-Allow-Origin"] = allowed_origins[0]
+
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Device-Id, X-AEGIS-Token"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -258,11 +299,32 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/health")
     def health():
-        return jsonify({"ok": True, "service": "aegis-supervisor", "api_version": 1, "weather_provider_configured": bool(app.config["OPENWEATHER_API_KEY"]), "timestamp": iso_now()})
+        return jsonify({
+            "ok": True,
+            "service": "aegis-supervisor",
+            "api_version": 2,
+            "weather_provider_configured": bool(app.config.get("OPENWEATHER_API_KEY")),
+            "timestamp": iso_now(),
+        })
+
+    @app.get("/api/simulink/inputs")
+    def simulink_inputs():
+        with lock, connect() as db:
+            state = load_state(db)
+            outlook_row = db.execute("SELECT payload FROM weather_outlook WHERE id=1").fetchone()
+            outlook = json.loads(outlook_row["payload"]) if outlook_row else None
+            irr, source, quality = resolve_irradiance(state, outlook, cfg, utc_now())
+            return jsonify({
+                "irradiance_w_m2": irr,
+                "irradiance_source": source,
+                "quality": quality,
+                "timestamp": iso_now(),
+                "valid_for_s": 60,
+            })
 
     @app.get("/api/weather/provider")
     def weather_provider():
-        api_key = app.config["OPENWEATHER_API_KEY"]
+        api_key = app.config.get("OPENWEATHER_API_KEY")
         if not api_key:
             return jsonify({"error": "Weather provider is not configured. Set OPENWEATHER_API_KEY in the Flask server environment."}), 503
         try:
@@ -321,7 +383,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/weather/tiles/<layer>/<int:zoom>/<int:x>/<int:y>.png")
     def weather_tile(layer: str, zoom: int, x: int, y: int):
-        api_key = app.config["OPENWEATHER_API_KEY"]
+        api_key = app.config.get("OPENWEATHER_API_KEY")
         tile_layers = {"rain": "precipitation_new", "wind": "wind_new"}
         if not api_key:
             return jsonify({"error": "Weather provider is not configured"}), 503
@@ -349,14 +411,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if not isinstance(weather, dict):
             return jsonify({"error": "weather must be an object"}), 400
         try:
-            latitude = finite_number(body.get("lat"), "lat", -90, 90)
-            longitude = finite_number(body.get("lon"), "lon", -180, 180)
+            latitude = finite_number(body.get("lat", cfg.plant_lat), "lat", -90, 90)
+            longitude = finite_number(body.get("lon", cfg.plant_lon), "lon", -180, 180)
             clouds = finite_number(weather.get("clouds", 0), "weather.clouds", 0, 100)
             clean_weather = {
                 key: value for key, value in weather.items()
                 if key in {"city", "temp", "feels_like", "temp_max", "temp_min", "humidity", "wind_kmh", "wind_deg", "clouds", "rain_mm_1h", "description", "pressure_hpa"}
             }
-            for key, bounds in {"temp": (-90, 65), "feels_like": (-100, 70), "temp_max": (-90, 70), "temp_min": (-100, 65), "humidity": (0, 100), "wind_kmh": (0, 400), "wind_deg": (0, 360), "rain_mm_1h": (0, 1000), "pressure_hpa": (100, 1200)}.items():
+            for key, bounds in {
+                "temp": (-90, 65), "feels_like": (-100, 70), "temp_max": (-90, 70),
+                "temp_min": (-100, 65), "humidity": (0, 100), "wind_kmh": (0, 400),
+                "wind_deg": (0, 360), "rain_mm_1h": (0, 1000), "pressure_hpa": (100, 1200),
+            }.items():
                 if key in clean_weather:
                     clean_weather[key] = finite_number(clean_weather[key], f"weather.{key}", *bounds)
             if "city" in clean_weather and not isinstance(clean_weather["city"], str):
@@ -382,21 +448,35 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify({"error": str(error)}), 400
 
         timestamp = utc_now()
-        irradiance = solar_irradiance_estimate(latitude, longitude, clouds, timestamp)
         snapshot = {"source": body.get("source", "openweather-client"), "lat": latitude, "lon": longitude, "weather": clean_weather, "forecast": forecast, "received_at": timestamp.isoformat()}
         with lock, connect() as db:
             state = load_state(db)
-            state["location"] = {"lat": latitude, "lon": longitude}
             state["weather"] = clean_weather
             state["forecast"] = forecast
             state["last_weather_at"] = timestamp.isoformat()
+            if app.config.get("TESTING"):
+                state["location"] = {"lat": latitude, "lon": longitude}
+
+            outlook_row = db.execute("SELECT payload FROM weather_outlook WHERE id=1").fetchone()
+            outlook = json.loads(outlook_row["payload"]) if outlook_row else None
+            irradiance, source, quality = resolve_irradiance(state, outlook, cfg, timestamp)
             state["irradiance"] = irradiance
-            state["irradiance_source"] = "cloud-cover-estimate"
+            state["irradiance_source"] = source
+            state["data_quality"] = quality
+
             db.execute("INSERT INTO weather_samples(received_at,payload) VALUES(?,?)", (timestamp.isoformat(), json.dumps(snapshot)))
             assess_mode(db, state)
             evaluate_electrolyzer(db, state)
             save_state(state, db)
-            return jsonify({"accepted": True, "irradiance_w_m2": irradiance, "irradiance_source": state["irradiance_source"], "recommendation": state["recommendation"], "pending_decision": state["pending_decision"], "alerts": state["alerts"]})
+            return jsonify({
+                "accepted": True,
+                "irradiance_w_m2": irradiance,
+                "irradiance_source": state["irradiance_source"],
+                "quality": state["data_quality"],
+                "recommendation": state["recommendation"],
+                "pending_decision": state["pending_decision"],
+                "alerts": state["alerts"],
+            })
 
     def ingest_telemetry(body: dict[str, Any], source: str):
         telemetry = body.get("telemetry", body)
@@ -422,6 +502,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         for key in ("operating_mode", "electrolyzer_enabled", "device_id", "sequence"):
             if key in telemetry:
                 clean[key] = telemetry[key]
+
         with lock, connect() as db:
             state = load_state(db)
             if "battery_soc" in values:
@@ -430,7 +511,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 state["h2_level"] = values["h2_level"]
             if "irradiance_w_m2" in values:
                 state["irradiance"] = values["irradiance_w_m2"]
-                state["irradiance_source"] = source
+                if source == "simulink":
+                    state["measured_irradiance"] = values["irradiance_w_m2"]
+                state["irradiance_source"] = "measured" if source == "simulink" else source
             for key in ("solar_power_w", "load_power_w"):
                 if key in values:
                     state[key] = values[key]
@@ -441,6 +524,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 if state["electrolyzer_control_mode"] == "manual":
                     state["electrolyzer_enabled"] = clean["electrolyzer_enabled"]
             state["last_telemetry_at"] = timestamp
+            state["simulink_connected"] = True
+
+            outlook_row = db.execute("SELECT payload FROM weather_outlook WHERE id=1").fetchone()
+            outlook = json.loads(outlook_row["payload"]) if outlook_row else None
+            irr, src, qual = resolve_irradiance(state, outlook, cfg, utc_now())
+            state["irradiance"] = irr
+            state["irradiance_source"] = src
+            state["data_quality"] = qual
+
             db.execute("INSERT INTO telemetry_samples(received_at,source,payload) VALUES(?,?,?)", (timestamp, source, json.dumps(clean)))
             evaluate_electrolyzer(db, state)
             assess_mode(db, state)
@@ -560,6 +652,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify({"items": values})
 
     initialize_db()
+
+    weather_svc = WeatherService(cfg, state_updater=update_from_weather_service)
+    app.weather_service = weather_svc
+    if not app.config.get("TESTING") and app.config.get("SCHEDULER_ENABLED", True):
+        weather_svc.start()
+
     return app
 
 

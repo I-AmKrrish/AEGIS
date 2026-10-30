@@ -412,23 +412,46 @@ const post=async(path,body)=>{
   online(true);return await response.json();
  }catch(error){online(false);console.warn('backend',error);return null}
 };
-async function loadWeather(){try{
- const response=await fetch(`${CONFIG.FLASK}/api/weather/provider?lat=${CONFIG.LAT}&lon=${CONFIG.LON}`);
- if(!response.ok){const errorBody=await response.json().catch(()=>({}));throw new Error(errorBody.error||`Weather service returned ${response.status}`)}
- const snapshot=await response.json(),c=snapshot.weather,L=snapshot.forecast,hr=d=>new Date(d).toLocaleTimeString([],{hour:'numeric'});
- W={city:c.city||CONFIG.CITY,temp:Math.round(c.temp),desc:c.description,feels:Math.round(c.feels_like),hi:Math.round(c.temp_max),lo:Math.round(c.temp_min),
-  wind:Math.round(c.wind_kmh),hum:c.humidity,clouds:c.clouds,uv:W.uv,rainIdx:L.findIndex(h=>h.pop>=40),
-  hours:[{t:'Now',temp:Math.round(c.temp),pop:Math.round((L[0]?.pop||0))},...L.slice(0,4).map(h=>({t:hr(h.timestamp),temp:Math.round(h.temp),pop:Math.round(h.pop)}))]};
- const forecast=L.map(item=>({timestamp:item.timestamp,pop:item.pop,clouds:item.clouds,rain_mm_3h:item.rain_mm_3h,wind_kmh:item.wind_kmh}));
+function updateWeatherDisplay(c,L){
+ if(!c)return;
+ const hr=d=>new Date(d).toLocaleTimeString([],{hour:'numeric'});
+ W={
+  city:c.city||CONFIG.CITY,
+  temp:c.temp!=null?Math.round(c.temp):'--',
+  desc:c.description||'—',
+  feels:c.feels_like!=null?Math.round(c.feels_like):'--',
+  hi:c.temp_max!=null?Math.round(c.temp_max):'--',
+  lo:c.temp_min!=null?Math.round(c.temp_min):'--',
+  wind:c.wind_kmh!=null?Math.round(c.wind_kmh):'--',
+  hum:c.humidity!=null?c.humidity:'--',
+  clouds:c.clouds||0,
+  uv:W.uv,
+  rainIdx:(L||[]).findIndex(h=>(h.pop||0)>=40),
+  hours:(L&&L.length)?[{t:'Now',temp:c.temp!=null?Math.round(c.temp):'--',pop:Math.round(L[0]?.pop||0)},...L.slice(0,4).map(h=>({t:hr(h.timestamp),temp:h.temp!=null?Math.round(h.temp):'--',pop:Math.round(h.pop||0)}))]:W.hours
+ };
  S.weather_available=true;
+}
+async function poll(){
+ try{
+  const r=await fetch(CONFIG.FLASK+'/api/state');
+  if(!r.ok)throw new Error(`Backend returned ${r.status}`);
+  const data=await r.json();
+  S={...S,...data};
+  if(data.weather)updateWeatherDisplay(data.weather,data.forecast);
+  online(true);
+ }catch(error){
+  online(false);
+  console.warn('backend state unavailable',error);
+ }
  render();
- const result=await post('/api/weather',{source:'openweather-server-proxy',lat:CONFIG.LAT,lon:CONFIG.LON,weather:c,forecast});
- if(result?.accepted){S.irradiance=result.irradiance_w_m2;S.irradiance_source=result.irradiance_source;S.recommendation=result.recommendation;S.pending_decision=result.pending_decision;S.alerts=result.alerts||S.alerts;render()}
- }catch(e){if(S.weather_provider_configured)console.warn('weather',e);S.weather_available=false;if(!S.weather_provider_configured){W={...W,city:CONFIG.CITY,temp:'--',desc:'Set server OpenWeather key',feels:'--',hi:'--',lo:'--',wind:'--',hum:'--',uv:'--',rainIdx:-1,hours:[{t:'Now',temp:'--',pop:'--'}]}}}
- render()}
-async function poll(){try{const r=await fetch(CONFIG.FLASK+'/api/state');if(!r.ok)throw new Error(`Backend returned ${r.status}`);S={...S,...await r.json()};online(true)}
- catch(error){online(false);console.warn('backend state unavailable',error)}render()}
+}
 render();online(false);poll();setInterval(poll,2000);
-navigator.geolocation?navigator.geolocation.getCurrentPosition(p=>{CONFIG.LAT=p.coords.latitude;CONFIG.LON=p.coords.longitude;loadWeather()},()=>loadWeather(),{timeout:4000}):loadWeather();
-setInterval(loadWeather,600000);
+if(navigator.geolocation){
+ navigator.geolocation.getCurrentPosition(p=>{
+  if(mapMarker&&map){
+   mapMarker.setLngLat([p.coords.longitude,p.coords.latitude]);
+   map.easeTo({center:[p.coords.longitude,p.coords.latitude]});
+  }
+ },()=>{},{timeout:4000});
+}
 </script></body></html>
