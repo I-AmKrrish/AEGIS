@@ -200,10 +200,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         last_declined = None
         if last_declined_row:
             dec_payload = json.loads(last_declined_row["payload"])
+            bad_days = 0
+            for r in dec_payload.get("reasons", []):
+                if "consecutive" in r:
+                    parts = r.split()
+                    if parts and parts[0].isdigit():
+                        bad_days = int(parts[0])
+                        break
             last_declined = {
                 "target_mode": last_declined_row["target_mode"],
                 "declined_at": last_declined_row["responded_at"],
-                "bad_days": len([d for d in dec_payload.get("reasons", []) if "consecutive" in d]),
+                "bad_days": bad_days,
                 "h2_level": state.get("h2_level", 100.0),
             }
 
