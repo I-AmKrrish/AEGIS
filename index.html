@@ -19,11 +19,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 .phone::after{content:"";position:absolute;inset:-15%;background:radial-gradient(circle at 30% 30%,rgba(255,255,255,.18),transparent 20%),linear-gradient(180deg,rgba(255,255,255,.08),transparent 55%,rgba(0,0,0,.28));animation:drift 16s ease-in-out alternate infinite;z-index:-1;opacity:.9}
 @keyframes drift{0%{transform:scale(1) translate3d(-2%,0,0)}100%{transform:scale(1.08) translate3d(2%,-2%,0)}}
 @media(max-width:500px){.phone{left:0;top:0;width:100vw;height:100dvh;transform:none;border-radius:0;box-shadow:none}}
-#bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:0;pointer-events:none;opacity:1;transition:opacity .3s ease}
-#bgPreset{position:absolute;inset:0;z-index:0;display:none;background-size:cover;background-position:center}
-.phone.preset-bg #bg{display:none}
-.phone.preset-bg #bgPreset{display:block}
-.phone.video-fallback #bg{display:none}
+#bgPreset{position:absolute;inset:0;z-index:0;display:block;background-size:cover;background-position:center}
 /* glass: base look (blur only). JS upgrades to refraction on Chromium */
 .glass{position:relative;background:rgba(255,255,255,.07);box-shadow:inset 0 1px 1px rgba(255,255,255,.18),inset 0 -1px 1px rgba(255,255,255,.06),0 10px 30px rgba(0,0,0,.25);-webkit-backdrop-filter:blur(22px) saturate(1.5);backdrop-filter:blur(22px) saturate(1.5)}
 .glass::after{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;pointer-events:none;background:linear-gradient(var(--a),rgba(255,255,255,.5),rgba(255,255,255,0) 30%,rgba(255,255,255,0) 70%,rgba(255,255,255,.18));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude}
@@ -60,7 +56,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 .w,.row,.h2{opacity:0;transform:translateY(12px);pointer-events:none;transition:opacity .65s ease,transform .65s cubic-bezier(.2,.75,.25,1),margin .42s cubic-bezier(.2,.75,.25,1)}
 #p-home.has-scrolled .w,#p-home.has-scrolled .row,#p-home.has-scrolled .h2{opacity:1;transform:translateY(0);pointer-events:auto}
 .loc{display:flex;gap:6px;align-items:center;font-size:12px;font-weight:600}
-.live{font-size:9px;font-weight:700;color:#4ade80;background:rgba(74,222,128,.16);padding:1px 5px;border-radius:5px}
+.live{font-size:9px;font-weight:700;color:#4ade80;background:rgba(74,222,128,.16);padding:2px 6px;border-radius:6px;letter-spacing:.3px}
 .temp{font-size:38px;font-weight:300;line-height:1.05}
 .sub{font-size:10px;color:rgba(255,255,255,.7)}
 .r{margin-top:10px;text-align:right;font-size:12px;line-height:1.45;color:rgba(255,255,255,.85);padding-right:16px}
@@ -138,7 +134,6 @@ h1{font-size:28px;padding:8px 4px}
 </style></head>
 <body>
 <div class="phone" id="phone">
-<video id="bg" src="bg_ready.mp4" autoplay muted loop playsinline></video>
 <div id="bgPreset" aria-hidden="true"></div>
 
 <main class="page on" id="p-home">
@@ -152,6 +147,32 @@ h1{font-size:28px;padding:8px 4px}
     </div>
     <div class="alert-preview" id="alertPreview" aria-label="Important notifications"></div>
   </header>
+
+  <!-- Decision Card on Home Screen (Phase 5) -->
+  <section class="glass decision-card" id="decisionCard" style="display:none;width:95%;align-self:center;border-radius:24px;padding:16px;flex-direction:column;gap:10px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);box-shadow:0 8px 32px rgba(0,0,0,.35)">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="width:10px;height:10px;border-radius:50%;background:#ff9f0a;flex:none"></span>
+      <h3 id="decisionTitle" style="font-size:15px;font-weight:700">Proposal</h3>
+    </div>
+    <p id="decisionQuestion" style="font-size:12px;line-height:1.4;color:rgba(255,255,255,.9)"></p>
+    <ul id="decisionEffects" style="font-size:11px;line-height:1.35;color:rgba(255,255,255,.75);padding-left:18px;margin:0"></ul>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px">
+      <button class="btn p" id="btnDecisionYes" type="button" style="padding:10px;font-size:13px">Yes, switch</button>
+      <button class="btn" id="btnDecisionNo" type="button" style="padding:10px;font-size:13px;background:rgba(255,255,255,.15);color:#fff">Not now</button>
+    </div>
+  </section>
+
+  <!-- Live Plant Power and Connection Status (Phase 5) -->
+  <div class="glass power-row" id="powerRow" style="width:95%;align-self:center;border-radius:20px;padding:12px 18px;display:flex;justify-content:space-between;align-items:center;font-size:12px;flex:none">
+    <div style="display:flex;gap:18px">
+      <div><span style="font-size:10px;color:rgba(255,255,255,.6);display:block">Solar Power</span><b id="solarPowerTxt" style="font-size:14px">-- W</b></div>
+      <div><span style="font-size:10px;color:rgba(255,255,255,.6);display:block">Load Power</span><b id="loadPowerTxt" style="font-size:14px">-- W</b></div>
+    </div>
+    <div style="text-align:right">
+      <span class="live" id="plantStatusBadge">PLANT OFFLINE</span>
+    </div>
+  </div>
+
   <section class="glass w" id="wx">
     <div>
       <div class="loc"><svg width="12" height="12" viewBox="0 0 24 24" fill="#fff"><path d="M12 22s-7-6-7-12a7 7 0 0 1 14 0c0 6-7 12-7 12z"/></svg><span id="city">—</span><span class="live" id="live">DEMO</span></div>
@@ -161,6 +182,7 @@ h1{font-size:28px;padding:8px 4px}
     <div class="r" id="stats"></div>
     <div class="hrs" id="hrs"></div>
   </section>
+
   <div class="row">
     <div class="glass rain" id="rain"><i></i><span id="rainTxt">Rain</span></div>
     <div class="col">
@@ -170,7 +192,7 @@ h1{font-size:28px;padding:8px 4px}
   </div>
   <div class="glass h2" id="h2"><i></i><span id="h2Txt">H₂ --%</span></div>
   <section class="glass electrolyzer" aria-label="Electrolyzer control">
-    <div class="electrolyzer-copy">Electrolyzer<small id="electrolyzerStatus">Automatic at 90% battery</small></div>
+    <div class="electrolyzer-copy">Electrolyzer<small id="electrolyzerStatus">Automatic setpoint loading...</small></div>
     <div class="electrolyzer-actions">
       <button class="electrolyzer-auto" id="electrolyzerAuto" type="button" aria-pressed="true">AUTO</button>
       <button class="electrolyzer-switch" id="electrolyzerToggle" type="button" role="switch" aria-label="Electrolyzer" aria-checked="false"><span></span></button>
@@ -178,15 +200,30 @@ h1{font-size:28px;padding:8px 4px}
   </section>
 </main>
 
-<main class="page" id="p-mode"><h1>Mode</h1>
+<main class="page" id="p-mode">
+  <h1>Mode</h1>
+  <!-- Mode Page Status & Auto Switch (Phase 5) -->
+  <section class="glass panel" id="modeControlPanel" style="display:flex;flex-direction:column;gap:8px">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <b id="modeControlTxt" style="font-size:15px">Control: Automatic</b>
+        <small id="appliedModeTxt" style="display:block;color:rgba(255,255,255,.7);font-size:11px;margin-top:2px">Applied: Balanced</small>
+      </div>
+      <span id="waitingPill" class="live" style="display:none;background:rgba(255,159,10,.25);color:#ff9f0a">waiting for system</span>
+    </div>
+    <button class="btn" id="returnAutoBtn" type="button" style="display:none;font-size:12px;padding:8px 12px;background:rgba(255,255,255,.18);color:#fff">Return to automatic</button>
+  </section>
   <div class="modes" id="modes">
     <button class="glass mode" data-m="eco"><b>Eco</b><span>Save hydrogen, charge the battery first</span></button>
     <button class="glass mode" data-m="balanced"><b>Balanced</b><span>Share load between solar, battery and hydrogen</span></button>
-    <button class="glass mode" data-m="boost"><b>Boost</b><span>Full power, use hydrogen when needed</span></button>
-  </div></main>
+    <button class="glass mode" data-m="boost"><b>Boost</b><span>Boost hydrogen reserves with reduced load</span></button>
+  </div>
+</main>
+
 <main class="page" id="p-profile"><h1>Profile</h1>
   <section class="profile-pane on" id="profileDetails" aria-label="Profile details">
     <div class="glass panel"><label class="name-label" for="userName">Your name</label><div class="profile-name-row"><input class="profile-name" id="userName" type="text" maxlength="40" autocomplete="name" placeholder="Enter your name"><button class="save-name" id="saveName" type="button">Save</button></div></div>
+    <div class="glass panel"><label class="name-label" for="operatorToken">Access Token (X-AEGIS-Token)</label><div class="profile-name-row"><input class="profile-name" id="operatorToken" type="password" placeholder="Enter server token if required"><button class="save-name" id="saveToken" type="button">Save</button></div></div>
     <div class="glass panel"><b>Location</b><br><span id="pLoc"></span></div>
     <div class="glass panel"><b>Server</b><br><span id="pSrv"></span></div>
   </section>
@@ -218,17 +255,37 @@ h1{font-size:28px;padding:8px 4px}
 const CONFIG={MAPBOX:'localStorage.getItem('mapboxToken')||''',FLASK:'http://127.0.0.1:5000',LAT:13.1007,LON:77.5963,CITY:'Yelahanka'};
 /* ------------------------------------------- */
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)],cl=(v,a=0,b=100)=>Math.min(b,Math.max(a,v));
-let S={battery_soc:46,h2_level:68,irradiance:0,irradiance_source:'unavailable',solar_power_w:null,load_power_w:null,mode:'balanced',applied_mode:null,mode_control:'auto',electrolyzer_control_mode:'auto',electrolyzer_enabled:false,electrolyzer_available:true,recommendation:null,pending_decision:null,weather_provider_configured:false,weather_available:false,online:false,alerts:[
- {id:1,severity:'warn',title:'Rain expected soon',message:'Rain is likely within 3 hours. Solar output will drop.'},
- {id:2,severity:'info',title:'Hydrogen tank at 68%',message:'Enough for about 14 hours at the current load.'}]};
+let S={
+  battery_soc:null,
+  h2_level:null,
+  irradiance:0,
+  irradiance_source:'unavailable',
+  data_quality:'fallback',
+  solar_power_w:null,
+  load_power_w:null,
+  mode:'balanced',
+  requested_mode:'balanced',
+  applied_mode:null,
+  mode_control:'auto',
+  electrolyzer_control_mode:'auto',
+  electrolyzer_enabled:false,
+  electrolyzer_available:true,
+  recommendation:null,
+  pending_decision:null,
+  active_setpoints:null,
+  weather_provider_configured:false,
+  weather_available:false,
+  online:false,
+  simulink_connected:false,
+  alerts:[]
+};
 const MODE_THEMES={
  eco:{className:'mode-eco',background:'linear-gradient(145deg,#0d3442 0%,#166653 42%,#172145 100%)'},
  balanced:{className:'mode-balanced',background:'linear-gradient(145deg,#062b4b 0%,#087d91 48%,#101d3b 100%)'},
  boost:{className:'mode-boost',background:'linear-gradient(145deg,#421f2d 0%,#a94d32 48%,#221b32 100%)'}
 };
 let activeModeTheme=null;
-let W={city:CONFIG.CITY,temp:27,desc:'Overcast',feels:27,hi:30,lo:19,wind:21,hum:55,uv:9,rainIdx:1,
- hours:[['Now',28,6],['12PM',27,6],['1PM',29,15],['2PM',29,25],['3PM',30,37]].map(([t,temp,pop])=>({t,temp,pop}))};
+let W={city:CONFIG.CITY,temp:'--',desc:'—',feels:'--',hi:'--',lo:'--',wind:'--',hum:'--',uv:'--',rainIdx:-1,hours:[]};
 
 /* ---------- clock ---------- */
 const tick=()=>{$('#clock').textContent=new Date().toLocaleTimeString([],{hour:'numeric',minute:'2-digit',hour12:false})};tick();setInterval(tick,10000);
@@ -254,35 +311,98 @@ const fit=()=>$('#phone').style.setProperty('--s',innerWidth>500?Math.min(1,(inn
 const setA=v=>document.documentElement.style.setProperty('--a',v+'deg');
 addEventListener('pointermove',e=>{const r=$('#phone').getBoundingClientRect();setA(Math.round(Math.atan2(e.clientY-(r.top+r.height/3),e.clientX-(r.left+r.width/2))*180/Math.PI+270))});
 addEventListener('deviceorientation',e=>{if(e.gamma!=null)setA(135+e.gamma*1.5)});
-if(matchMedia('(prefers-reduced-motion:reduce)').matches)$('#bg').pause();
 
 /* ---------- render ---------- */
 function applyModeTheme(mode){
  const theme=MODE_THEMES[mode]||MODE_THEMES.balanced,phone=$('#phone');
  if(activeModeTheme===mode)return;
  phone.classList.remove('mode-eco','mode-balanced','mode-boost');
- phone.classList.add(theme.className,'preset-bg');
- $('#bg').pause();$('#bgPreset').style.background=theme.background;
+ phone.classList.add(theme.className);
+ $('#bgPreset').style.background=theme.background;
  activeModeTheme=mode;
 }
+
 function render(){
  applyModeTheme(S.mode);
- $('#city').textContent=W.city;$('#temp').textContent=W.temp+'°';$('#desc').textContent=W.desc;$('#feels').textContent='Feels like '+W.feels+'°';
+ $('#city').textContent=W.city;
+ $('#temp').textContent=W.temp!==null&&W.temp!=='--'?W.temp+'°':'--°';
+ $('#desc').textContent=W.desc;
+ $('#feels').textContent=W.feels!==null&&W.feels!=='--'?'Feels like '+W.feels+'°':'';
  $('#live').textContent=!S.online?'OFFLINE':S.weather_available?'LIVE':S.weather_provider_configured?'STALE':'NO WX API';
- $('#stats').innerHTML=`H: ${W.hi}° L: ${W.lo}°<br>${W.wind} km/h W<br>${W.hum}% Humidity<br>UV ${W.uv}`;
- $('#hrs').innerHTML=W.hours.map(h=>`<div>${h.t}<b>${h.temp}°</b><em>${h.pop}%</em></div>`).join('');
+ $('#stats').innerHTML=`H: ${W.hi!==null&&W.hi!=='--'?W.hi+'°':'--'} L: ${W.lo!==null&&W.lo!=='--'?W.lo+'°':'--'}<br>${W.wind!==null&&W.wind!=='--'?W.wind+' km/h W':'--'}<br>${W.hum!==null&&W.hum!=='--'?W.hum+'% Humidity':'--'}<br>${W.uv!==null&&W.uv!=='--'?'UV '+W.uv:'UV --'}`;
+ $('#hrs').innerHTML=W.hours.length?W.hours.map(h=>`<div>${h.t}<b>${h.temp!==null&&h.temp!=='--'?h.temp+'°':'--'}</b><em>${h.pop}%</em></div>`).join(''):'<div style="grid-column:1/-1;font-size:10px;color:rgba(255,255,255,.5)">Awaiting forecast...</div>';
+
  const ri=W.rainIdx;$('#rain').style.setProperty('--f',(ri<0?6:Math.max(10,100-ri*16))+'%');
  $('#rainTxt').innerHTML='Rain<br>'+(ri<0?'none soon':ri===0?'now':'in ~'+ri*3+'h');
- $('#irr').textContent=Math.round(S.irradiance);$('#arc').style.strokeDashoffset=301.6*(1-cl(S.irradiance/1000,0,1));
- $('#bat').textContent=Math.round(S.battery_soc)+'%';$('#bfill').setAttribute('width',Math.max(1,29*S.battery_soc/100));
- $('#h2').style.setProperty('--f',cl(S.h2_level)+'%');$('#h2Txt').textContent='H₂ '+Math.round(S.h2_level)+'%';
+
+ $('#irr').textContent=Math.round(S.irradiance||0);
+ $('#arc').style.strokeDashoffset=301.6*(1-cl((S.irradiance||0)/1000,0,1));
+
+ // Battery & H2 with proper -- fallbacks
+ if(S.battery_soc!==null&&S.battery_soc!==undefined){
+   $('#bat').textContent=Math.round(S.battery_soc)+'%';
+   $('#bfill').setAttribute('width',Math.max(1,29*S.battery_soc/100));
+ } else {
+   $('#bat').textContent='--%';
+   $('#bfill').setAttribute('width',1);
+ }
+
+ if(S.h2_level!==null&&S.h2_level!==undefined){
+   $('#h2').style.setProperty('--f',cl(S.h2_level)+'%');
+   $('#h2Txt').textContent='H₂ '+Math.round(S.h2_level)+'%';
+ } else {
+   $('#h2').style.setProperty('--f','0%');
+   $('#h2Txt').textContent='H₂ --%';
+ }
+
+ // Live Solar & Load Power + Plant Status Badge
+ $('#solarPowerTxt').textContent=S.solar_power_w!=null?Math.round(S.solar_power_w)+' W':'-- W';
+ $('#loadPowerTxt').textContent=S.load_power_w!=null?Math.round(S.load_power_w)+' W':'-- W';
+ const plantLive=!!S.simulink_connected;
+ $('#plantStatusBadge').textContent=plantLive?'PLANT LIVE':'PLANT OFFLINE';
+ $('#plantStatusBadge').style.background=plantLive?'rgba(74,222,128,.2)':'rgba(255,159,10,.2)';
+ $('#plantStatusBadge').style.color=plantLive?'#4ade80':'#ff9f0a';
+
+ // Electrolyzer status from server setpoints
  const electrolyzerEnabled=!!S.electrolyzer_enabled,electrolyzerAuto=S.electrolyzer_control_mode!=='manual';
+ const startSoc=S.active_setpoints?Math.round(S.active_setpoints.electrolyzer_start_soc):90;
  $('#electrolyzerToggle').setAttribute('aria-checked',String(electrolyzerEnabled));
  $('#electrolyzerAuto').setAttribute('aria-pressed',String(electrolyzerAuto));
- $('#electrolyzerStatus').textContent=electrolyzerAuto?'Automatic at 90% battery':`Manual control · ${electrolyzerEnabled?'running':'stopped'}`;
+ $('#electrolyzerStatus').textContent=electrolyzerAuto?`Automatic at ${startSoc}% battery`:`Manual control · ${electrolyzerEnabled?'running':'stopped'}`;
+
+ // Decision Card on Home Screen
+ const decCard=$('#decisionCard');
+ if(S.pending_decision&&S.pending_decision.status==='pending'){
+   decCard.style.display='flex';
+   $('#decisionTitle').textContent=S.pending_decision.title||'Mode Recommendation';
+   $('#decisionQuestion').textContent=S.pending_decision.question||'';
+   $('#decisionEffects').innerHTML=(S.pending_decision.effects||[]).map(e=>`<li>${e}</li>`).join('');
+ } else {
+   decCard.style.display='none';
+ }
+
+ // Mode Page Status & Waiting Pill
+ $('#modeControlTxt').textContent=`Control: ${S.mode_control==='auto'?'Automatic':'Manual'}`;
+ $('#returnAutoBtn').style.display=S.mode_control==='manual'?'block':'none';
+ const reqMode=S.requested_mode||S.mode;
+ const isApplied=S.applied_mode===reqMode;
+ $('#appliedModeTxt').textContent=S.applied_mode?`Applied: ${S.applied_mode.toUpperCase()}`:'Applied: --';
+ $('#waitingPill').style.display=(!isApplied&&S.applied_mode!==null)?'inline-block':'none';
+
  if(S.recommendation)$('#pSrv').textContent=`${S.mode_control==='auto'?'Auto':'Manual'} mode · ${S.recommendation.reason}`;
- $('#alerts').innerHTML=S.alerts.length?S.alerts.map(a=>`<div class="al"><s class="${a.severity==='critical'?'crit':a.severity==='info'?'info':''}"></s><div><b>${a.title}</b>${a.message}</div></div>`).join(''):'<div class="al">No active alerts.</div>';
+
+ // Alerts list rendering with individual dismiss
+ $('#alerts').innerHTML=S.alerts.length?S.alerts.map(a=>`
+   <div class="al" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+     <div style="display:flex;gap:10px">
+       <s class="${a.severity==='critical'?'crit':a.severity==='info'?'info':''}"></s>
+       <div><b>${a.title}</b>${a.message}</div>
+     </div>
+     <button class="btn" style="padding:4px 8px;font-size:10px;background:rgba(0,0,0,.15);border-radius:8px" onclick="dismissAlert('${a.id}')">Dismiss</button>
+   </div>
+ `).join(''):'<div class="al">No active alerts.</div>';
  $('#dot').classList.toggle('show',S.alerts.length>0);
+
  const preview=$('#alertPreview');preview.replaceChildren();
  S.alerts.slice(0,4).forEach(alert=>{
   const button=document.createElement('button'),indicator=document.createElement('i'),summary=document.createElement('span');
@@ -291,14 +411,36 @@ function render(){
   summary.textContent=`${alert.title}: ${alert.message}`;
   button.append(indicator,summary);button.onclick=()=>toggleCard(true);preview.append(button);
  });
+
  $$('.mode').forEach(m=>m.classList.toggle('on',m.dataset.m===S.mode));
  $('#pLoc').textContent=`${W.city} (${CONFIG.LAT.toFixed(4)}, ${CONFIG.LON.toFixed(4)})`;
 }
-const online=v=>{S.online=v;$('#live').textContent=!v?'OFFLINE':S.weather_available?'LIVE':S.weather_provider_configured?'STALE':'NO WX API';if(!v)$('#pSrv').textContent='Backend offline. Last received values retained.'};
+
+const online=v=>{
+  S.online=v;
+  $('#live').textContent=!v?'OFFLINE':S.weather_available?'LIVE':S.weather_provider_configured?'STALE':'NO WX API';
+  if(!v)$('#pSrv').textContent='Backend offline. Last received values retained.';
+};
 
 /* ---------- bell + alert card ---------- */
 const toggleCard=on=>{const o=on??!$('#card').classList.contains('on');$('#card').classList.toggle('on',o);$('#bell').classList.toggle('on',o)};
-$('#bell').onclick=()=>toggleCard();$('#close').onclick=()=>toggleCard(false);$('#clear').onclick=()=>{S.alerts=[];render();toggleCard(false)};
+$('#bell').onclick=()=>toggleCard();
+$('#close').onclick=()=>toggleCard(false);
+
+// Clear all alerts calls server
+$('#clear').onclick=async()=>{
+  await post('/api/alerts/clear',{});
+  S.alerts=[];
+  render();
+  toggleCard(false);
+};
+
+window.dismissAlert=async(id)=>{
+  const r=await post('/api/alerts/'+id+'/dismiss',{});
+  if(r?.alerts)S.alerts=r.alerts;else S.alerts=S.alerts.filter(x=>x.id!==id);
+  render();
+};
+
 const homePage=$('#p-home'),homeHeader=$('#homeHeader');
 const introSpacer=$('#introSpacer'),heroName=$('#heroName');
 const sizeExpandedHeader=()=>{
@@ -330,14 +472,48 @@ const saveUserName=()=>{
 };
 $('#saveName').onclick=saveUserName;
 $('#userName').addEventListener('keydown',event=>{if(event.key==='Enter')saveUserName()});
+
+// Token save in Profile
+const tokenInput=$('#operatorToken');
+if(tokenInput){
+ tokenInput.value=localStorage.getItem('aegisToken')||'';
+ $('#saveToken').onclick=()=>{
+  localStorage.setItem('aegisToken',tokenInput.value.trim());
+  alert('Token saved');
+ };
+}
+
 $$('.ic').forEach(b=>b.onclick=()=>{const t=b.dataset.t;$$('.ic').forEach(x=>x.classList.toggle('on',x===b));
  $$('.page').forEach(p=>p.classList.toggle('on',p.id==='p-'+(t==='home'?'home':t)));$('#map').classList.toggle('on',t==='map');toggleCard(false);
  if(t==='map')openMap()});
+
+// Decision card buttons
+$('#btnDecisionYes').onclick=async()=>{
+ if(!S.pending_decision)return;
+ const r=await post('/api/decisions/'+S.pending_decision.id+'/respond',{approve:true});
+ if(r?.state)S={...S,...r.state};
+ render();
+};
+$('#btnDecisionNo').onclick=async()=>{
+ if(!S.pending_decision)return;
+ const r=await post('/api/decisions/'+S.pending_decision.id+'/respond',{approve:false});
+ if(r?.state)S={...S,...r.state};
+ render();
+};
+
+// Return to auto button
+$('#returnAutoBtn').onclick=async()=>{
+ const r=await post('/api/mode/auto',{});
+ if(r?.state)S={...S,...r.state};
+ render();
+};
+
 $$('.mode').forEach(m=>m.onclick=async()=>{
  const result=await post('/api/mode',{mode:m.dataset.m});
  if(result?.state)S={...S,...result.state,online:true};else S.mode=m.dataset.m;
  render();
 });
+
 $('#electrolyzerToggle').onclick=async()=>{
  const enabled=$('#electrolyzerToggle').getAttribute('aria-checked')!=='true';
  const result=await post('/api/electrolyzer',{control_mode:'manual',enabled});
@@ -349,6 +525,7 @@ $('#electrolyzerAuto').onclick=async()=>{
  if(result?.state)S={...S,...result.state,online:true};
  render();
 };
+
 function showMapWeather(message,detail=''){
  $('#mapWeather').innerHTML=`<strong>${message}</strong>${detail?`<small>${detail}</small>`:''}`;
 }
@@ -363,7 +540,7 @@ async function refreshMapWeather(){
   const response=await fetch(`${CONFIG.FLASK}/api/state`);
   if(!response.ok)throw new Error('Weather service unavailable');
   const state=await response.json(),weather=state.weather||{},rain=Number(weather.rain_mm_1h||0),wind=Math.round(Number(weather.wind_kmh||0)),direction=Math.round(Number(weather.wind_deg||0));
-    if(!state.weather_provider_configured){showMapWeather('Weather API not configured','Set OPENWEATHER_API_KEY in the Flask server environment.');return}
+  if(!state.weather_provider_configured){showMapWeather('Weather API not configured','Set OPENWEATHER_API_KEY in the Flask server environment.');return}
   const compass=['N','NE','E','SE','S','SW','W','NW'][Math.round(direction/45)%8];
   if(!state.last_weather_at)throw new Error('No weather received yet');
   showMapWeather(`${rain.toFixed(rain%1?1:0)} mm rain / 1h`,`${wind} km/h wind ${compass} · ${CONFIG.LAT.toFixed(4)}, ${CONFIG.LON.toFixed(4)}`);
@@ -404,10 +581,13 @@ function openMap(){if(!CONFIG.MAPBOX){$('#mapMsg').style.display='block';return}
   if(mapWeatherTimer===null)mapWeatherTimer=setInterval(refreshMapWeather,300000);
  };document.head.appendChild(s)}
 
-/* ---------- data: Flask + OpenWeather ---------- */
+/* ---------- data: Flask communication ---------- */
 const post=async(path,body)=>{
  try{
-  const response=await fetch(CONFIG.FLASK+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const token=localStorage.getItem('aegisToken')||'';
+  const headers={'Content-Type':'application/json'};
+  if(token)headers['X-AEGIS-Token']=token;
+  const response=await fetch(CONFIG.FLASK+path,{method:'POST',headers,body:JSON.stringify(body||{})});
   if(!response.ok)throw new Error(`Backend returned ${response.status}`);
   online(true);return await response.json();
  }catch(error){online(false);console.warn('backend',error);return null}
@@ -425,9 +605,9 @@ function updateWeatherDisplay(c,L){
   wind:c.wind_kmh!=null?Math.round(c.wind_kmh):'--',
   hum:c.humidity!=null?c.humidity:'--',
   clouds:c.clouds||0,
-  uv:W.uv,
+  uv:c.uv!=null?c.uv:'--',
   rainIdx:(L||[]).findIndex(h=>(h.pop||0)>=40),
-  hours:(L&&L.length)?[{t:'Now',temp:c.temp!=null?Math.round(c.temp):'--',pop:Math.round(L[0]?.pop||0)},...L.slice(0,4).map(h=>({t:hr(h.timestamp),temp:h.temp!=null?Math.round(h.temp):'--',pop:Math.round(h.pop||0)}))]:W.hours
+  hours:(L&&L.length)?[{t:'Now',temp:c.temp!=null?Math.round(c.temp):'--',pop:Math.round(L[0]?.pop||0)},...L.slice(0,4).map(h=>({t:hr(h.timestamp),temp:h.temp!=null?Math.round(h.temp):'--',pop:Math.round(h.pop||0)}))]:[]
  };
  S.weather_available=true;
 }
