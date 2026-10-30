@@ -8,6 +8,7 @@ commands for a Simulink process to poll and acknowledge upon user approval.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -36,6 +37,13 @@ from weather_service import (
     resolve_irradiance,
     solar_irradiance_estimate,
 )
+
+logger = logging.getLogger("aegis")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -173,7 +181,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "INSERT INTO commands(kind,payload,status,created_at,expires_at) VALUES(?,?, 'pending', ?, ?)",
             (kind, json.dumps(payload, separators=(",", ":")), now.isoformat(), expires_at),
         )
-        return int(cursor.lastrowid)
+        cmd_id = int(cursor.lastrowid)
+        logger.info("[AUDIT] Command %d queued: kind=%s, expires_at=%s", cmd_id, kind, expires_at)
+        return cmd_id
 
     def run_policy_assessment(db: sqlite3.Connection, state: dict[str, Any]) -> None:
         """Run policy engine pure function evaluation and update proposals / lifecycle."""
@@ -225,6 +235,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 "reason": proposal.reasons[0] if proposal.reasons else "Proposed mode change.",
                 "confidence": "high",
             }
+            logger.info("[AUDIT] Proposal %s created: mode=%s suggested_load=%.1fW", proposal.id, proposal.target_mode, proposal.suggested_load_limit_w)
 
         elif action == "withdraw":
             if active_proposal:
@@ -233,6 +244,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     db.execute("UPDATE decisions SET status='withdrawn', responded_at=? WHERE id=?", (iso_now(), p_id))
             state["pending_decision"] = None
             add_alert(state, "info", "Mode proposal withdrawn", eval_result["reason"])
+            logger.info("[AUDIT] Proposal withdrawn: %s", eval_result["reason"])
 
         elif action == "expire":
             if active_proposal:
@@ -240,6 +252,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 if p_id:
                     db.execute("UPDATE decisions SET status='expired', responded_at=? WHERE id=?", (iso_now(), p_id))
             state["pending_decision"] = None
+            logger.info("[AUDIT] Proposal expired")
 
     def update_from_weather_service(weather: dict[str, Any] | None = None, outlook: dict[str, Any] | None = None) -> None:
         with lock, connect() as db:
@@ -283,7 +296,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             try:
                 telem_dt = datetime.fromisoformat(last_telem.replace("Z", "+00:00"))
                 age_s = (utc_now() - telem_dt).total_seconds()
-                state["simulink_connected"] = (age_s <= cfg.telemetry_stale_seconds)
+                is_connected = (age_s <= cfg.telemetry_stale_seconds)
+                state["simulink_connected"] = is_connected
+                if not is_connected:
+                    add_alert(
+                        state,
+                        "warn",
+                        "Simulink telemetry offline",
+                        f"No telemetry received for {age_s:.0f} seconds (limit {cfg.telemetry_stale_seconds:.0f}s).",
+                        key="simulink:offline",
+                    )
+                else:
+                    state["alerts"] = [a for a in state["alerts"] if a.get("key") != "simulink:offline"]
             except Exception:
                 state["simulink_connected"] = False
         else:
@@ -309,18 +333,62 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         state["pending_command_count"] = pending_commands
         return state
 
+    def check_request_auth(endpoint_type: str = "any") -> bool:
+        """Validate request against X-AEGIS-Token or Bearer Authorization header."""
+        has_any_token = bool(cfg.aegis_token or cfg.device_token or cfg.operator_token)
+        if not has_any_token:
+            return True  # Dev mode: open access when no token configured
+
+        token = request.headers.get("X-AEGIS-Token", "").strip()
+        if not token and "Authorization" in request.headers:
+            auth_hdr = request.headers["Authorization"].strip()
+            if auth_hdr.lower().startswith("bearer "):
+                token = auth_hdr[7:].strip()
+
+        if not token:
+            return False
+
+        if endpoint_type == "device":
+            valid = {t for t in (cfg.device_token, cfg.aegis_token) if t}
+        elif endpoint_type == "operator":
+            valid = {t for t in (cfg.operator_token, cfg.aegis_token) if t}
+        else:
+            valid = {t for t in (cfg.aegis_token, cfg.device_token, cfg.operator_token) if t}
+
+        return token in valid
+
+    @app.before_request
+    def authenticate():
+        # Pre-flights: return 204 No Content directly
+        if request.method == "OPTIONS":
+            return Response("", status=204)
+        if request.path in ("/api/health", "/api/weather/provider") or request.path.startswith("/api/weather/tiles/"):
+            return None
+
+        # Simulink endpoints (GET and POST) require device token
+        if request.path.startswith("/api/simulink/"):
+            if not check_request_auth("device"):
+                logger.warning("Unauthorized access to %s from %s", request.path, request.remote_addr)
+                return jsonify({"error": "Unauthorized: invalid or missing X-AEGIS-Token header"}), 401
+
+        # All other POST endpoints require operator token
+        elif request.method == "POST":
+            if not check_request_auth("operator"):
+                logger.warning("Unauthorized POST to %s from %s", request.path, request.remote_addr)
+                return jsonify({"error": "Unauthorized: invalid or missing X-AEGIS-Token header"}), 401
+
     @app.after_request
     def cors(response):
-        allowed_origins = app.config.get("CORS_ORIGINS", ["*"])
+        allowed_origins = cfg.cors_origins
         req_origin = request.headers.get("Origin")
-        if "*" in allowed_origins or not allowed_origins:
-            response.headers["Access-Control-Allow-Origin"] = "*"
-        elif req_origin in allowed_origins:
+        if req_origin and req_origin in allowed_origins:
             response.headers["Access-Control-Allow-Origin"] = req_origin
+        elif "*" in allowed_origins or not allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = "*"
         else:
             response.headers["Access-Control-Allow-Origin"] = allowed_origins[0]
 
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Device-Id, X-AEGIS-Token"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Device-Id, X-AEGIS-Token, Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -396,9 +464,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         try:
             current, forecast_data = fetch_json("weather"), fetch_json("forecast")
         except HTTPError as error:
+            logger.warning("Weather provider rejected request: HTTP %d", error.code)
             return jsonify({"error": "Weather provider rejected the request", "provider_status": error.code}), 502
         except (URLError, TimeoutError, json.JSONDecodeError) as error:
-            return jsonify({"error": "Weather provider is temporarily unavailable", "detail": str(error)}), 502
+            logger.warning("Weather provider unavailable: %s", type(error).__name__)
+            return jsonify({"error": "Weather provider is temporarily unavailable"}), 502
 
         current_weather = current.get("weather") or [{}]
         current_main = current.get("main") or {}
@@ -450,7 +520,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except HTTPError as error:
             return jsonify({"error": "Weather tile provider rejected the request", "provider_status": error.code}), 502
         except (URLError, TimeoutError) as error:
-            return jsonify({"error": "Weather tile provider is unavailable", "detail": str(error)}), 502
+            return jsonify({"error": "Weather tile provider is unavailable"}), 502
 
     @app.get("/api/state")
     def get_state():
@@ -649,6 +719,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             cmd_id = queue_command(db, "mode", cmd_payload)
             state["last_command_id"] = cmd_id
             save_state(state, db)
+            logger.info("[AUDIT] Operator selected mode %s directly (command %d)", mode, cmd_id)
             return jsonify({"accepted": True, "command_id": cmd_id, "state": state})
 
     @app.post("/api/mode/auto")
@@ -658,6 +729,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             state["mode_control"] = "auto"
             run_policy_assessment(db, state)
             save_state(state, db)
+            logger.info("[AUDIT] Operator enabled automatic mode control")
             return jsonify({"accepted": True, "state": state})
 
     @app.post("/api/electrolyzer")
@@ -675,14 +747,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             if control_mode == "manual":
                 state["electrolyzer_enabled"] = body["enabled"]
                 cmd_payload = {"enabled": body["enabled"], "control_mode": "manual", "source": "operator_override"}
-                reason = "operator_manual_override"
             else:
                 cmd_payload = {"control_mode": "auto", "source": "operator_release_to_simulink"}
-                reason = "operator_release_to_auto"
 
             cmd_id = queue_command(db, "electrolyzer", cmd_payload)
             state["last_command_id"] = cmd_id
             save_state(state, db)
+            logger.info("[AUDIT] Electrolyzer command %d: control_mode=%s", cmd_id, control_mode)
             return jsonify({"accepted": True, "command_id": cmd_id, "state": state})
 
     @app.post("/api/decisions/<decision_id>/respond")
@@ -720,12 +791,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 state["last_command_id"] = cmd_id
                 add_alert(state, "info", f"Mode switch to {target_mode.title()} approved", "Command queued for Simulink.")
                 save_state(state, db)
+                logger.info("[AUDIT] Proposal %s approved by operator -> mode=%s cmd=%d", decision_id, target_mode, cmd_id)
                 return jsonify({"accepted": True, "status": "approved", "command_id": cmd_id, "state": state})
             else:
                 db.execute("UPDATE decisions SET status='declined', responded_at=? WHERE id=?", (now_iso, decision_id))
                 state["pending_decision"] = None
                 add_alert(state, "info", "Mode proposal declined", "Operating mode remains unchanged.")
                 save_state(state, db)
+                logger.info("[AUDIT] Proposal %s declined by operator", decision_id)
                 return jsonify({"accepted": True, "status": "declined", "state": state})
 
     @app.post("/api/decisions/<decision_id>/cancel")
@@ -742,7 +815,33 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             state["mode_control"] = "manual"
             add_alert(state, "info", "Planned mode change cancelled", "The current mode will remain active.")
             save_state(state, db)
+            logger.info("[AUDIT] Proposal %s cancelled by operator", decision_id)
             return jsonify({"accepted": True, "status": "declined", "state": state})
+
+    @app.post("/api/alerts/clear")
+    def clear_alerts():
+        with lock, connect() as db:
+            state = load_state(db)
+            state["alerts"] = []
+            save_state(state, db)
+            logger.info("[AUDIT] Operator cleared all alerts")
+            return jsonify({"accepted": True, "alerts": []})
+
+    @app.post("/api/alerts/<alert_id>/dismiss")
+    def dismiss_alert(alert_id: str):
+        with lock, connect() as db:
+            state = load_state(db)
+            original_len = len(state.get("alerts", []))
+            state["alerts"] = [a for a in state.get("alerts", []) if a.get("id") != alert_id]
+            save_state(state, db)
+            logger.info("[AUDIT] Operator dismissed alert %s", alert_id)
+            return jsonify({"accepted": True, "dismissed": original_len != len(state["alerts"]), "alerts": state["alerts"]})
+
+    @app.get("/api/alerts")
+    def get_alerts():
+        with lock, connect() as db:
+            state = load_state(db)
+            return jsonify({"alerts": state.get("alerts", [])})
 
     @app.get("/api/simulink/commands")
     def simulink_commands():
@@ -787,6 +886,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
             if cmd_row["expires_at"] and cmd_row["expires_at"] <= now_iso:
                 db.execute("UPDATE commands SET status='expired' WHERE id=?", (command_id,))
+                logger.warning("[AUDIT] Attempt to ack expired command %d rejected", command_id)
                 return jsonify({"error": "command expired and cannot be acknowledged", "command_id": command_id}), 410
 
             db.execute("UPDATE commands SET status=?, acknowledged_at=? WHERE id=?", (status, now_iso, command_id))
@@ -805,6 +905,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     )
 
             save_state(state, db)
+            logger.info("[AUDIT] Command %d acked: status=%s, applied_mode=%s", command_id, status, state.get("applied_mode"))
             return jsonify({
                 "accepted": True,
                 "command_id": command_id,
