@@ -63,6 +63,8 @@ class Proposal:
     suggested_load_limit_w: float
     created_at: str
     expires_at: str
+    bad_days: int = 0
+    h2_level_at_proposal: float = 0.0
     status: str = "pending"  # pending, approved, declined, expired, withdrawn
     status_reason: str = ""
 
@@ -328,6 +330,8 @@ def evaluate_policy(
                 suggested_load_limit_w=sustainable_w,
                 created_at=now.isoformat(),
                 expires_at=(now + timedelta(minutes=config.proposal_ttl_minutes)).isoformat(),
+                bad_days=run.length_days,
+                h2_level_at_proposal=round(h2_level, 1),
                 status="pending",
             )
             return {"proposal": proposal, "action": "create", "reason": "Boost conditions satisfied."}
@@ -364,6 +368,8 @@ def evaluate_policy(
                 suggested_load_limit_w=eco_load,
                 created_at=now.isoformat(),
                 expires_at=(now + timedelta(minutes=config.proposal_ttl_minutes)).isoformat(),
+                bad_days=1,
+                h2_level_at_proposal=round(h2_level, 1),
                 status="pending",
             )
             return {"proposal": proposal, "action": "create", "reason": "Eco conditions satisfied."}
@@ -400,6 +406,8 @@ def evaluate_policy(
                 suggested_load_limit_w=config.load_nominal_w,
                 created_at=now.isoformat(),
                 expires_at=(now + timedelta(minutes=config.proposal_ttl_minutes)).isoformat(),
+                bad_days=0,
+                h2_level_at_proposal=round(h2_level, 1),
                 status="pending",
             )
             return {"proposal": proposal, "action": "create", "reason": "Return to Balanced conditions satisfied."}
