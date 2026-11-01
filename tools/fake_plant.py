@@ -44,10 +44,14 @@ class FakePlant:
         initial_h2: float = 50.0,
         panel_area_m2: float = 1.0,
         panel_efficiency: float = 0.20,
+        fixed_irradiance: float | None = None,
+        offline: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.accel = max(0.1, accel)
+        self.fixed_irradiance = fixed_irradiance
+        self.offline = offline
 
         # Physical constants
         self.load_nominal_w = load_nominal_w
@@ -111,13 +115,20 @@ class FakePlant:
             return None
 
     def fetch_inputs(self) -> None:
-        """Poll /api/simulink/inputs to get current irradiance."""
+        """Poll /api/simulink/inputs to get current irradiance, unless fixed."""
+        if self.fixed_irradiance is not None:
+            self.irradiance_w_m2 = float(self.fixed_irradiance)
+            return
+        if self.offline:
+            return
         res = self._http_request("GET", "/api/simulink/inputs")
         if res and "irradiance_w_m2" in res:
             self.irradiance_w_m2 = float(res["irradiance_w_m2"])
 
     def fetch_setpoints(self) -> None:
         """Poll /api/simulink/setpoints to recover supervisory parameters."""
+        if self.offline:
+            return
         res = self._http_request("GET", "/api/simulink/setpoints")
         if res and "parameters" in res:
             p = res["parameters"]
@@ -130,6 +141,8 @@ class FakePlant:
 
     def poll_and_apply_commands(self) -> None:
         """Poll /api/simulink/commands and acknowledge applied actions."""
+        if self.offline:
+            return
         res = self._http_request("GET", f"/api/simulink/commands?after={self.last_command_id}")
         if not res or "commands" not in res:
             return
@@ -234,6 +247,8 @@ class FakePlant:
     def post_telemetry(self) -> None:
         """Post telemetry snapshot to /api/simulink/telemetry."""
         self.sequence += 1
+        if self.offline:
+            return
         payload = {
             "telemetry": {
                 "battery_soc": round(self.battery_soc, 1),
@@ -251,10 +266,19 @@ class FakePlant:
     def run_loop(self, duration_s: float | None = None) -> None:
         """Main simulator loop executing with time acceleration."""
         print(f"=== AEGIS Simulink Fake Plant Started ===")
-        print(f"Target URL: {self.base_url}")
+        if self.offline:
+            print(f"Mode: Standalone / Offline Simulation (no HTTP backend required)")
+        else:
+            print(f"Target URL: {self.base_url}")
+        if self.fixed_irradiance is not None:
+            if self.fixed_irradiance == 0.0:
+                print(f"Condition: Forced NIGHT TIME (Irradiance = 0.0 W/m2, Solar = 0 W)")
+            else:
+                print(f"Condition: Fixed Irradiance = {self.fixed_irradiance:.1f} W/m2")
         print(f"Acceleration: {self.accel:.1f}x (1 real sec = {self.accel:.1f} sim sec)")
         print(f"Nominal Load: {self.load_nominal_w} W, Battery: {self.battery_hours} h ({self.battery_wh:.0f} Wh), Tank: {self.h2_tank_wh:.0f} Wh")
-        print("Polling setpoints...")
+        if not self.offline:
+            print("Polling setpoints...")
         self.fetch_setpoints()
 
         step_real_sec = 1.0
@@ -310,8 +334,12 @@ def main() -> None:
     parser.add_argument("--battery-soc", type=float, default=60.0, help="Initial battery SOC %")
     parser.add_argument("--h2-level", type=float, default=50.0, help="Initial hydrogen level %")
     parser.add_argument("--nominal-load", type=float, default=100.0, help="Nominal load in Watts")
+    parser.add_argument("--night", action="store_true", help="Simulate night time condition (irradiance = 0 W/m2)")
+    parser.add_argument("--irradiance", type=float, default=None, help="Explicit irradiance override in W/m2")
+    parser.add_argument("--offline", action="store_true", help="Run standalone without contacting the AEGIS web server")
 
     args = parser.parse_args()
+    irr_override = 0.0 if args.night else args.irradiance
     plant = FakePlant(
         base_url=args.url,
         token=args.token,
@@ -319,6 +347,8 @@ def main() -> None:
         initial_battery_soc=args.battery_soc,
         initial_h2=args.h2_level,
         load_nominal_w=args.nominal_load,
+        fixed_irradiance=irr_override,
+        offline=args.offline,
     )
     plant.run_loop(duration_s=args.duration)
 

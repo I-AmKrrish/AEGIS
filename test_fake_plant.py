@@ -173,6 +173,23 @@ class TestFakePlant(unittest.TestCase):
         self.assertIn("telemetry", args[2])
         self.assertEqual(args[2]["telemetry"]["operating_mode"], "balanced")
 
+    @patch.object(FakePlant, "_http_request")
+    def test_night_condition_fixed_irradiance(self, mock_http: MagicMock) -> None:
+        night_plant = FakePlant(
+            base_url="http://127.0.0.1:5000",
+            fixed_irradiance=0.0,
+            offline=True,
+        )
+        night_plant.fetch_inputs()
+        mock_http.assert_not_called()
+        self.assertEqual(night_plant.irradiance_w_m2, 0.0)
+
+        # Step 1 hour: 100 W load at night drains battery
+        initial_soc = night_plant.battery_soc
+        night_plant.step_physical_model(3600.0)
+        self.assertEqual(night_plant.solar_power_w, 0.0)
+        self.assertLess(night_plant.battery_soc, initial_soc)
+
 
 if __name__ == "__main__":
     unittest.main()
