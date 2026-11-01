@@ -114,6 +114,18 @@ To run only the 9 end-to-end acceptance scenarios:
 python -m unittest -v test_acceptance.py
 ```
 
+### 3.5. Connecting the Real Simulink Model (MATLAB)
+1. Open MATLAB and navigate to the repository directory (`SolarHydrogen`).
+2. Open the Simulink model:
+   ```matlab
+   open_system('solar_hydrogen_microgrid');
+   ```
+3. Run the synchronization bridge script:
+   ```matlab
+   run('tools/aegis_simulink_bridge.m');
+   ```
+   The bridge communicates with the AEGIS supervisor on `http://127.0.0.1:5000` via REST API, automatically applies setpoints to your Simulink blocks (`set_param`), polls and executes mode commands, and streams model telemetry to the web dashboard.
+
 ---
 
 ## 4. Configuration & Environment Variables
