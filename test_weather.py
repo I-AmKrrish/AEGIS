@@ -168,6 +168,34 @@ class WeatherAndIrradianceTests(unittest.TestCase):
             self.assertIsNotNone(svc.last_error)
             self.assertIn("Network unreachable", svc.last_error)
 
+    def test_weather_tile_in_memory_cache(self):
+        # Configure app with weather key
+        app = create_app({
+            "TESTING": True,
+            "DATABASE": f"{self.temp_dir.name}/tile_test.sqlite3",
+            "OPENWEATHER_API_KEY": "test-key-123",
+        })
+        client = app.test_client()
+
+        fake_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = fake_png
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("app.urlopen", return_value=mock_resp) as mock_urlopen:
+            # First request: MISS, fetches from upstream
+            res1 = client.get("/api/weather/tiles/rain/3/4/2.png")
+            self.assertEqual(res1.status_code, 200)
+            self.assertEqual(res1.headers.get("X-Cache"), "MISS")
+            self.assertEqual(mock_urlopen.call_count, 1)
+
+            # Second request: HIT, served instantly from memory cache (<1ms)
+            res2 = client.get("/api/weather/tiles/rain/3/4/2.png")
+            self.assertEqual(res2.status_code, 200)
+            self.assertEqual(res2.headers.get("X-Cache"), "HIT")
+            # Upstream was not called again!
+            self.assertEqual(mock_urlopen.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

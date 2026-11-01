@@ -13,6 +13,7 @@ import math
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -516,6 +517,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             })
         return jsonify({"lat": latitude, "lon": longitude, "weather": normalized_weather, "forecast": forecast})
 
+    tile_cache: dict[str, tuple[float, bytes]] = {}
+    tile_cache_lock = threading.Lock()
+    MAX_TILE_CACHE = 512
+    TILE_TTL_S = 300.0  # 5 minutes in-memory cache
+
     @app.get("/api/weather/tiles/<layer>/<int:zoom>/<int:x>/<int:y>.png")
     def weather_tile(layer: str, zoom: int, x: int, y: int):
         api_key = app.config.get("OPENWEATHER_API_KEY")
@@ -524,11 +530,24 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify({"error": "Weather provider is not configured"}), 503
         if layer not in tile_layers or not 0 <= zoom <= 18 or not 0 <= x < 2**zoom or not 0 <= y < 2**zoom:
             return jsonify({"error": "invalid weather tile request"}), 404
+
+        cache_key = f"{layer}_{zoom}_{x}_{y}"
+        now_ts = time.time()
+        with tile_cache_lock:
+            cached = tile_cache.get(cache_key)
+            if cached and (now_ts - cached[0]) < TILE_TTL_S:
+                return Response(cached[1], mimetype="image/png", headers={"Cache-Control": "public, max-age=300", "X-Cache": "HIT"})
+
         url = f"https://tile.openweathermap.org/map/{tile_layers[layer]}/{zoom}/{x}/{y}.png?{urlencode({'appid': api_key})}"
         try:
             with urlopen(url, timeout=8) as upstream:
                 image = upstream.read()
-                return Response(image, mimetype="image/png", headers={"Cache-Control": "public, max-age=300"})
+                with tile_cache_lock:
+                    if len(tile_cache) >= MAX_TILE_CACHE:
+                        oldest_key = min(tile_cache.keys(), key=lambda k: tile_cache[k][0])
+                        tile_cache.pop(oldest_key, None)
+                    tile_cache[cache_key] = (now_ts, image)
+                return Response(image, mimetype="image/png", headers={"Cache-Control": "public, max-age=300", "X-Cache": "MISS"})
         except HTTPError as error:
             return jsonify({"error": "Weather tile provider rejected the request", "provider_status": error.code}), 502
         except (URLError, TimeoutError) as error:

@@ -582,15 +582,22 @@ function openMap(){if(!CONFIG.MAPBOX){$('#mapMsg').style.display='block';return}
  };document.head.appendChild(s)}
 
 /* ---------- data: Flask communication ---------- */
+const pendingPosts=new Set();
 const post=async(path,body)=>{
+ const callKey=path+JSON.stringify(body||{});
+ if(pendingPosts.has(callKey))return null;
+ pendingPosts.add(callKey);
+ const controller=new AbortController();
+ const timeoutId=setTimeout(()=>controller.abort(),8000);
  try{
   const token=localStorage.getItem('aegisToken')||'';
   const headers={'Content-Type':'application/json'};
   if(token)headers['X-AEGIS-Token']=token;
-  const response=await fetch(CONFIG.FLASK+path,{method:'POST',headers,body:JSON.stringify(body||{})});
+  const response=await fetch(CONFIG.FLASK+path,{method:'POST',headers,body:JSON.stringify(body||{}),signal:controller.signal});
   if(!response.ok)throw new Error(`Backend returned ${response.status}`);
   online(true);return await response.json();
- }catch(error){online(false);console.warn('backend',error);return null}
+ }catch(error){online(false);console.warn('backend post error',error);return null}
+ finally{clearTimeout(timeoutId);pendingPosts.delete(callKey)}
 };
 function updateWeatherDisplay(c,L){
  if(!c)return;
@@ -611,9 +618,14 @@ function updateWeatherDisplay(c,L){
  };
  S.weather_available=true;
 }
+let isPolling=false;
 async function poll(){
+ if(isPolling)return;
+ isPolling=true;
+ const controller=new AbortController();
+ const timeoutId=setTimeout(()=>controller.abort(),4000);
  try{
-  const r=await fetch(CONFIG.FLASK+'/api/state');
+  const r=await fetch(CONFIG.FLASK+'/api/state',{signal:controller.signal});
   if(!r.ok)throw new Error(`Backend returned ${r.status}`);
   const data=await r.json();
   S={...S,...data};
@@ -622,6 +634,9 @@ async function poll(){
  }catch(error){
   online(false);
   console.warn('backend state unavailable',error);
+ }finally{
+  clearTimeout(timeoutId);
+  isPolling=false;
  }
  render();
 }
