@@ -21,7 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from config import MODES, AegisConfig, load_config
 from policy import (
@@ -409,6 +409,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.route("/api/<path:path>", methods=["OPTIONS"])
     def options(path: str):
         return "", 204
+
+    @app.get("/")
+    def index():
+        return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
+
+    @app.get("/index.html")
+    def index_page():
+        return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
 
     @app.get("/api/health")
     def health():

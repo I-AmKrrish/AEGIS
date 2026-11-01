@@ -227,6 +227,16 @@ class AegisApiTests(unittest.TestCase):
         self.assertIn("tile-secret", upstream.call_args.args[0])
         self.assertNotIn(b"tile-secret", response.data)
 
+    def test_root_serves_index_html(self):
+        with self.client.get("/") as res:
+            self.assertEqual(res.status_code, 200)
+            self.assertIn("text/html", res.mimetype)
+            self.assertIn(b"<title>AEGIS</title>", res.data)
+
+        with self.client.get("/index.html") as res_direct:
+            self.assertEqual(res_direct.status_code, 200)
+            self.assertIn("text/html", res_direct.mimetype)
+
 
 if __name__ == "__main__":
     unittest.main()

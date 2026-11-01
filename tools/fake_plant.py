@@ -280,11 +280,11 @@ class FakePlant:
                 # Print status summary
                 print(
                     f"[{time.strftime('%H:%M:%S')}] Mode: {self.operating_mode:<8} | "
-                    f"Irr: {self.irradiance_w_m2:5.1f} W/m² | "
+                    f"Irr: {self.irradiance_w_m2:5.1f} W/m2 | "
                     f"Solar: {self.solar_power_w:5.1f} W | "
                     f"Load: {self.load_power_w:5.1f} W | "
                     f"Batt: {self.battery_soc:4.1f}% | "
-                    f"H₂: {self.h2_level:4.1f}% | "
+                    f"H2: {self.h2_level:4.1f}% | "
                     f"Electrolyzer: {'ON ' if self.electrolyzer_enabled else 'OFF'} | "
                     f"FC: {'ON ' if self.fuel_cell_active else 'OFF'}"
                 )
